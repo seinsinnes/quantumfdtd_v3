@@ -19,10 +19,10 @@ extern dcomp ***w;
 extern dcomp ***W;
 
 // this holds the current values of the 1st excited wavefunction
-extern dcomp ***w1;
-
+//extern dcomp ***w1;
+extern dcomp ****wexcited;
 // this holds the current values of the 2nd excited wavefunction
-extern dcomp ***w2;
+//extern dcomp ***w2;
 
 // this holds the snapshots of the wavefunction
 extern dcomp ****wstore;

@@ -698,20 +698,20 @@ void findExcitedStates(const double time, int step)
   for (int sx = 0; sx < NUMX + 2; sx++)
     for (int sy = 0; sy < NUM + 2; sy++)
       for (int sz = 0; sz < NUM + 2; sz++)
-        w1[sx][sy][sz] = wstore[snap][sx][sy][sz] - overlap * w[sx][sy][sz];
+        wexcited[0][sx][sy][sz] = wstore[snap][sx][sy][sz] - overlap * w[sx][sy][sz];
 
   // compute observables
-  computeObservables(w1);
+  computeObservables(wexcited[0]);
 
   // normalize
   MPI_Bcast(&normalizationCollect, 1, MPI_DOUBLE, 0, workers_comm);
-  normalizeWavefunction(w1);
+  normalizeWavefunction(wexcited[0]);
 
   if (DUMPSNAPS > 0 && step > 0)
   {
     // output snapshot of excited states
     sprintf(label, "%d_1_%d", step, nodeID);
-    outputSnapshot(w1, label);
+    outputSnapshot(wexcited[0], label);
   }
 
   if (nodeID == 1)
@@ -740,26 +740,26 @@ void findExcitedStates(const double time, int step)
 
   // compute overlap
   overlap = computeOverlap(wstore[snap], w);
-  dcomp overlap2 = computeOverlap(wstore[snap], w1);
+  dcomp overlap2 = computeOverlap(wstore[snap], wexcited[0]);
 
   // subtract overlap
   for (int sx = 0; sx < NUMX + 2; sx++)
     for (int sy = 0; sy < NUM + 2; sy++)
       for (int sz = 0; sz < NUM + 2; sz++)
-        w2[sx][sy][sz] = wstore[snap][sx][sy][sz] - overlap * w[sx][sy][sz] - overlap2 * w1[sx][sy][sz];
+        wexcited[1][sx][sy][sz] = wstore[snap][sx][sy][sz] - overlap * w[sx][sy][sz] - overlap2 * wexcited[0][sx][sy][sz];
 
   // compute observables
-  computeObservables(w2);
+  computeObservables(wexcited[1]);
 
   // normalize
   MPI_Bcast(&normalizationCollect, 1, MPI_DOUBLE, 0, workers_comm);
-  normalizeWavefunction(w2);
+  normalizeWavefunction(wexcited[1]);
 
   if (DUMPSNAPS > 0 && step > 0)
   {
     // output snapshot of excited states
     sprintf(label, "%d_2_%d", step, nodeID);
-    outputSnapshot(w2, label);
+    outputSnapshot(wexcited[1], label);
   }
 
   if (nodeID == 1)
@@ -790,9 +790,9 @@ void findExcitedStates(const double time, int step)
     // For now only output ground state, NFS causes delays for writes and this eats time
 
     sprintf(label, "1_%d", nodeID);
-    outputWavefunction(w1, label);
+    outputWavefunction(wexcited[0], label);
     sprintf(label, "2_%d", nodeID);
-    outputWavefunction(w2, label);
+    outputWavefunction(wexcited[1], label);
   }
 
   return;

@@ -285,7 +285,13 @@ void setInitialConditions(int seedMult)
                 W[sx][sy][sz] = 0;
 
     // zero out ith wf for safety's sake
-    for (sx = 0; sx < NUMX + 2; sx++)
+    for (int n = 0; n < NUMSNAPSHOTS; n++)
+        for (sx = 0; sx < NUMX + 2; sx++)
+            for (sy = 0; sy < NUM + 2; sy++)
+                for (sz = 0; sz < NUM + 2; sz++)
+                    wexcited[n][sx][sy][sz] = 0;
+    
+    /*for (sx = 0; sx < NUMX + 2; sx++)
         for (sy = 0; sy < NUM + 2; sy++)
             for (sz = 0; sz < NUM + 2; sz++)
                 w1[sx][sy][sz] = 0;
@@ -293,7 +299,7 @@ void setInitialConditions(int seedMult)
     for (sx = 0; sx < NUMX + 2; sx++)
         for (sy = 0; sy < NUM + 2; sy++)
             for (sz = 0; sz < NUM + 2; sz++)
-                w2[sx][sy][sz] = 0;
+                w2[sx][sy][sz] = 0;*/
 
     // zero out t_kin for safety's sake
     for (sx = 0; sx < NUMX + 2; sx++)

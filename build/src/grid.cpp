@@ -30,10 +30,11 @@ dcomp ***w;
 dcomp ***W;
 
 // this holds the current values of the 1st excited wavefunction
-dcomp ***w1;
+//dcomp ***w_1;
+dcomp ****wexcited;
 
 // this holds the current values of the 2nd excited wavefunction
-dcomp ***w2;
+//dcomp ***w2;
 
 // this holds the snapshots of the wavefunction
 dcomp ****wstore;
@@ -74,7 +75,7 @@ void allocateMemory()
         for (int sy = 0; sy < NUM + 2; sy++)
             W[sx][sy] = new dcomp[NUM + 2];
 
-    w1 = new dcomp **[NUMX + 2];
+    /*w1 = new dcomp **[NUMX + 2];
     for (int sx = 0; sx < NUMX + 2; sx++)
         w1[sx] = new dcomp *[NUM + 2];
     for (int sx = 0; sx < NUMX + 2; sx++)
@@ -86,7 +87,18 @@ void allocateMemory()
         w2[sx] = new dcomp *[NUM + 2];
     for (int sx = 0; sx < NUMX + 2; sx++)
         for (int sy = 0; sy < NUM + 2; sy++)
-            w2[sx][sy] = new dcomp[NUM + 2];
+            w2[sx][sy] = new dcomp[NUM + 2];*/
+            
+    wexcited = new dcomp ***[NUMSNAPSHOTS];
+    for (int n = 0; n < NUMSNAPSHOTS; n++)
+        wexcited[n] = new dcomp **[NUMX + 2];
+    for (int n = 0; n < NUMSNAPSHOTS; n++)
+        for (int sx = 0; sx < NUMX + 2; sx++)
+            wexcited[n][sx] = new dcomp *[NUM + 2];
+    for (int n = 0; n < NUMSNAPSHOTS; n++)
+        for (int sx = 0; sx < NUMX + 2; sx++)
+            for (int sy = 0; sy < NUM + 2; sy++)
+                wexcited[n][sx][sy] = new dcomp[NUM + 2];
 
     v = new dcomp **[NUMX + 2];
     for (int sx = 0; sx < NUMX + 2; sx++)
