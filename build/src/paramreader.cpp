@@ -59,6 +59,8 @@ void setParameter(const char *key, const char *value)
         DATAFOLD = strdup(value);
     if (strcmp(key, "POTCRITR") == 0)
         POTCRITR = atoi(value);
+    if (strcmp(key, "NUMSNAPSHOTS") == 0)
+        NUMSNAPSHOTS = atoi(value);
     // double/float params
     if (strcmp(key, "A") == 0)
         A = atof(value);
