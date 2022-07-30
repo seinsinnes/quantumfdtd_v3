@@ -126,14 +126,14 @@ void allocateMemory()
         for (int sy = 0; sy < NUM + 2; sy++)
             b[sx][sy] = new dcomp[NUM + 2];
 
-    int snaps = 2; // currently only use two snapshots in order to reduce memory footprint
-    wstore = new dcomp ***[snaps];
-    for (int n = 0; n < snaps; n++)
+    //int snaps = 2; // currently only use two snapshots in order to reduce memory footprint
+    wstore = new dcomp ***[NUMSNAPSHOTS];
+    for (int n = 0; n < NUMSNAPSHOTS; n++)
         wstore[n] = new dcomp **[NUMX + 2];
-    for (int n = 0; n < snaps; n++)
+    for (int n = 0; n < NUMSNAPSHOTS; n++)
         for (int sx = 0; sx < NUMX + 2; sx++)
             wstore[n][sx] = new dcomp *[NUM + 2];
-    for (int n = 0; n < snaps; n++)
+    for (int n = 0; n < NUMSNAPSHOTS; n++)
         for (int sx = 0; sx < NUMX + 2; sx++)
             for (int sy = 0; sy < NUM + 2; sy++)
                 wstore[n][sx][sy] = new dcomp[NUM + 2];

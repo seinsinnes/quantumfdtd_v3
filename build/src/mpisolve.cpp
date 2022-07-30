@@ -41,7 +41,7 @@ using namespace std;
 
 // these global vars are initialized from parameters file
 // defaults set here are overridden by that file
-int NUMX = 20, NUM = 20, STEPS = 40000, UPDATE = 100, SNAPUPDATE = 1000;
+int NUMX = 20, NUM = 20, STEPS = 40000, UPDATE = 100, SNAPUPDATE = 1000, NUMSNAPSHOTS = 4;
 int POTENTIAL = 0, INITCONDTYPE = 0, INITCONDAXIS = 0, INITSYMMETRY = 0, SAVEWAVEFNCS = 0, DUMPSNAPS = 0, SNAPDUMP = 0;
 double A = 0.05, EPS = 0.001, SIG = 0.06, MASS = 1.0, SIGMA = 0.223, TOLERANCE = -1;
 int KINTERM = 0;                      //KINTERM GLOBAL VARIABLE (FLAG FOR THE USAGE OF RELATIVISTIC KINTETIC TERM)
@@ -505,7 +505,7 @@ void solve()
       {
         lastenergy = energytot;
         // record and output snapshot
-        snapcnt = (snapcnt + 1) % 2; // assume only two snapshots for now, so cycle
+        snapcnt = (snapcnt + 1) % NUMSNAPSHOTS; // assume only two snapshots for now, so cycle
         recordSnapshot(w, snapcnt);
       }
     }
@@ -736,7 +736,7 @@ void findExcitedStates(const double time, int step)
   /*---------------------------------------------------------------------------*/
 
   int save = snap;
-  snap = (snapcnt + 1) % 2;
+  snap = (snapcnt + 1) % NUMSNAPSHOTS;
 
   // compute overlap
   overlap = computeOverlap(wstore[snap], w);
