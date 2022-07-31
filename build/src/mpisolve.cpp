@@ -686,96 +686,64 @@ void findExcitedStates(const double time, int step)
   dcomp ener, dEtau;
 
   /*---------------------------------------------------------------------------*/
-  /* Find first excited state                                                  */
+  /* Find excited states                                                  */
   /*---------------------------------------------------------------------------*/
 
-  int snap = snapcnt;
-
-  // compute overlap
-  dcomp overlap = computeOverlap(w, wstore[snap]);
-
-  // subtract overlap
-  for (int sx = 0; sx < NUMX + 2; sx++)
-    for (int sy = 0; sy < NUM + 2; sy++)
-      for (int sz = 0; sz < NUM + 2; sz++)
-        wexcited[0][sx][sy][sz] = wstore[snap][sx][sy][sz] - overlap * w[sx][sy][sz];
-
-  // compute observables
-  computeObservables(wexcited[0]);
-
-  // normalize
-  MPI_Bcast(&normalizationCollect, 1, MPI_DOUBLE, 0, workers_comm);
-  normalizeWavefunction(wexcited[0]);
-
-  if (DUMPSNAPS > 0 && step > 0)
+  dcomp *overlap = new dcomp[NUMSNAPSHOTS];
+  for (int n = 0; n < NUMSNAPSHOTS; n++)
   {
-    // output snapshot of excited states
-    sprintf(label, "%d_1_%d", step, nodeID);
-    outputSnapshot(wexcited[0], label);
-  }
-
-  if (nodeID == 1)
-  {
-
-    outputSummaryData("First Excited State", time, step);
-
-    // consistency check and warning if fail
-    ener = energyCollect / normalizationCollect;
-    dEtau = (ener - EGrnd) * timef;
-    if (real(dEtau) < 4.)
+    int snap = (snapcnt + n) % NUMSNAPSHOTS;
+  
+    // compute overlap
+    for (int i = 0; i <= n; i++)
     {
-      print_line();
-      cout << "==> WARNING: states nearly degenerate, tau_f too small!" << endl;
-      print_line();
+      if (i==0)
+        overlap[i] = computeOverlap(wstore[snap], w);
+      else
+        overlap[i] = computeOverlap(wstore[snap], wexcited[i-1]);
     }
-  }
-  EGrnd = ener; // redfine EGrnd to hold energy of first excited state for comparison below
-
-  /*---------------------------------------------------------------------------*/
-  /* Find second excited state                                                 */
-  /*---------------------------------------------------------------------------*/
-
-  int save = snap;
-  snap = (snapcnt + 1) % NUMSNAPSHOTS;
-
-  // compute overlap
-  overlap = computeOverlap(wstore[snap], w);
-  dcomp overlap2 = computeOverlap(wstore[snap], wexcited[0]);
-
-  // subtract overlap
-  for (int sx = 0; sx < NUMX + 2; sx++)
-    for (int sy = 0; sy < NUM + 2; sy++)
-      for (int sz = 0; sz < NUM + 2; sz++)
-        wexcited[1][sx][sy][sz] = wstore[snap][sx][sy][sz] - overlap * w[sx][sy][sz] - overlap2 * wexcited[0][sx][sy][sz];
-
-  // compute observables
-  computeObservables(wexcited[1]);
-
-  // normalize
-  MPI_Bcast(&normalizationCollect, 1, MPI_DOUBLE, 0, workers_comm);
-  normalizeWavefunction(wexcited[1]);
-
-  if (DUMPSNAPS > 0 && step > 0)
-  {
-    // output snapshot of excited states
-    sprintf(label, "%d_2_%d", step, nodeID);
-    outputSnapshot(wexcited[1], label);
-  }
-
-  if (nodeID == 1)
-  {
-
-    outputSummaryData("Second Excited State", time, step);
-
-    // consistency check and warning if fail
-    ener = energyCollect / normalizationCollect;
-    dEtau = (ener - EGrnd) * timef;
-    if (real(dEtau) < 4.)
+  
+    // subtract overlap
+    for (int sx = 0; sx < NUMX + 2; sx++)
+      for (int sy = 0; sy < NUM + 2; sy++)
+        for (int sz = 0; sz < NUM + 2; sz++)
+        {
+          wexcited[n][sx][sy][sz] = wstore[snap][sx][sy][sz] - overlap[0] * w[sx][sy][sz];
+          for (int i = 1; i < n; i++)
+            wexcited[n][sx][sy][sz] -= overlap[i] * wexcited[i][sx][sy][sz];
+        }
+  
+    // compute observables
+    computeObservables(wexcited[n]);
+  
+    // normalize
+    MPI_Bcast(&normalizationCollect, 1, MPI_DOUBLE, 0, workers_comm);
+    normalizeWavefunction(wexcited[n]);
+  
+    if (DUMPSNAPS > 0 && step > 0)
     {
-      print_line();
-      cout << "==> WARNING: states nearly degenerate, tau_f too small!" << endl;
-      print_line();
+      // output snapshot of excited states
+      sprintf(label, "%d_%d_%d", step, n, nodeID);
+      outputSnapshot(wexcited[n], label);
     }
+  
+    if (nodeID == 1)
+    {
+      sprintf(label, "Excited State: %d", n);
+      outputSummaryData(label, time, step);
+  
+      // consistency check and warning if fail
+      ener = energyCollect / normalizationCollect;
+      dEtau = (ener - EGrnd) * timef;
+      if (real(dEtau) < 4.)
+      {
+        print_line();
+        sprintf(label, "%d <-> %d", n, n+1);
+        cout << label << " ==> WARNING: states nearly degenerate, tau_f too small!" << endl;
+        print_line();
+      }
+    }
+    EGrnd = ener; // redfine EGrnd to hold energy of first excited state for comparison below
   }
 
   /*---------------------------------------------------------------------------*/
@@ -788,11 +756,12 @@ void findExcitedStates(const double time, int step)
     sprintf(label, "0_%d", nodeID);
     outputWavefunction(w, label);
     // For now only output ground state, NFS causes delays for writes and this eats time
-
-    sprintf(label, "1_%d", nodeID);
-    outputWavefunction(wexcited[0], label);
-    sprintf(label, "2_%d", nodeID);
-    outputWavefunction(wexcited[1], label);
+    for (int n = 0; n < NUMSNAPSHOTS; n++)
+    {
+      sprintf(label, "%d_%d", n+1 ,nodeID);
+      outputWavefunction(wexcited[n], label);
+    }
+    
   }
 
   return;
