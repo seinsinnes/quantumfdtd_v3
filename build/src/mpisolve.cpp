@@ -1,14 +1,6 @@
 /*
-
-  Parallelized Finite Difference Time Domain Schrodinger Eq Solver
-
-  mpisolve.c
-
-  Copyright (c) Michael Strickland, Rafael L. Delgado
-
-  GNU General Public License (GPLv3)
-  See detailed text in license directory
-
+  Parallelized Finite Difference Time Domain Acoustic / Helmholtz Solver
+  Adapted from quantumfdtd_v3 (Michael Strickland, Rafael L. Delgado)
 */
 
 #include <iostream>
@@ -22,11 +14,16 @@
 #include <ctime>
 #include <cerrno>
 #include <complex>
+#include <vector>
+#include <algorithm>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/times.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#include <openvdb/openvdb.h>
+#include <openvdb/tools/Interpolation.h>
 
 using namespace std;
 
@@ -39,45 +36,44 @@ using namespace std;
 #include "outputroutines.h"
 #include "paramreader.h"
 
-// these global vars are initialized from parameters file
-// defaults set here are overridden by that file
+// Global parameters initialized from input/params.txt
 int NUMX = 20, NUM = 20, STEPS = 40000, UPDATE = 100, SNAPUPDATE = 1000;
 int POTENTIAL = 0, INITCONDTYPE = 0, INITCONDAXIS = 0, INITSYMMETRY = 0, SAVEWAVEFNCS = 0, DUMPSNAPS = 0, SNAPDUMP = 0;
 double A = 0.05, EPS = 0.001, SIG = 0.06, MASS = 1.0, SIGMA = 0.223, TOLERANCE = -1;
-int KINTERM = 0;                      //KINTERM GLOBAL VARIABLE (FLAG FOR THE USAGE OF RELATIVISTIC KINTETIC TERM)
-char *EXTPOT = NULL;                  //EXTERNAL POTENTIAL FILE
-char *DATAFOLD = NULL;                //EXTERNAL DATA FOLDER
-int SAVEPOT = 0;                      //SAVE POTENTIAL
-int SAVEDECAY = 0;                    //SAVE DECAY TABLE
-double POTCRITR = 3., POTFLATR = -1.; //CRITIAL R
-// mpi vars
+int KINTERM = 0;
+char *EXTPOT = NULL;
+char *DATAFOLD = NULL;
+int SAVEPOT = 0;
+int SAVEDECAY = 0;
+double POTCRITR = 3., POTFLATR = -1.;
+
+// MPI variables
 int nodeID, tmpnodeID, numNodes;
 
-// files
-fstream debug_out;
+// Global step tracker for the continuous acoustic source
+int global_step = 0;
 
-// debug flag; options are DEBUG_{OFF,ON,FULL}
+// Files
+fstream debug_out;
 int debug = DEBUG_OFF;
 
-// used for MPI non-blocking sends
+// MPI non-blocking send/receive buffers
 double *leftSendBuffer, *rightSendBuffer;
 MPI_Status leftSendStatus, rightSendStatus;
 MPI_Status leftSendMessageStatus, rightSendMessageStatus;
 MPI_Request leftSend, rightSend;
 MPI_Request leftMessageSend, rightMessageSend;
 
-// used for MPI non-blocking receives
 double *leftReceiveBuffer, *rightReceiveBuffer;
 MPI_Status leftReceiveStatus, rightReceiveStatus;
 MPI_Status leftReceiveMessageStatus, rightReceiveMessageStatus;
 MPI_Request leftReceive, rightReceive;
 MPI_Request leftMessageReceive, rightMessageReceive;
 
-// used for worker only intercommunication
 MPI_Comm workers_comm;
 MPI_Group workers_group;
 
-// used for fftw3 library
+// FFTW3 structures
 struct fftw_par_t
 {
   fftw_plan plan_fftw, plan_ifftw;
@@ -95,36 +91,26 @@ inline void fftw_to_dcomp(const fftw_complex &in, dcomp *out) { *out = dcomp(in[
 inline double pow2(double a) { return a * a; }
 inline dcomp pow2(dcomp a) { return a * a; }
 
-// variables which will be loaded and reduced across nodes
-dcomp energy = 0;               // the local node energy
-dcomp energyCollect = 0;        // the total energy
-dcomp normalization = 0;        // the local node normalization squared
-dcomp normalizationCollect = 0; // the total normalization squared
-dcomp vInfinity = 0;            // the local node expectation value of v_infty
-dcomp vInfinityCollect = 0;     // the total expectation value of v_infty
-dcomp rRMS2 = 0;                // the local node <r^2>
-dcomp rRMS2Collect = 0;         // the total <r^2>
-dcomp xAvg = 0;                 // the local <x>
-dcomp xAvgCollect = 0;          // the total <x>
-dcomp yAvg = 0;                 // the local <y>
-dcomp yAvgCollect = 0;          // the total <y>
-dcomp zAvg = 0;                 // the local <z>
-dcomp zAvgCollect = 0;          // the total <z>
-
-// ground state energy and final time saved in global var after convergence
+// Observables (kept for link compatibility with outputroutines.cpp)
+dcomp energy = 0, energyCollect = 0;
+dcomp normalization = 0, normalizationCollect = 0;
+dcomp vInfinity = 0, vInfinityCollect = 0;
+dcomp rRMS2 = 0, rRMS2Collect = 0;
+dcomp xAvg = 0, xAvgCollect = 0;
+dcomp yAvg = 0, yAvgCollect = 0;
+dcomp zAvg = 0, zAvgCollect = 0;
 dcomp EGrnd, timef;
-
-// counter used for recording snapshots
 int snapcnt = -1;
 
 void computeObservables(dcomp ***wfnc);
+void loadWaveSpeedsFromVDB(const std::string& vdb_filepath);
+void exportVDBFrame(int frame_number);
 
 int main(int argc, char *argv[])
 {
   int done = 0, checksum = 0;
   char message[1024];
   char fname[1024];
-  int exclude[1];
   struct tms starttime, endtime;
 
   MPI_Init(&argc, &argv);
@@ -133,15 +119,9 @@ int main(int argc, char *argv[])
   MPI_Status status;
   MPI_Group all_group;
 
-  //For dealing with old Michael's setup, with a control node on nodeID=0
   nodeID = tmpnodeID + 1;
 
-  // setup group consisting of computational nodes only for internal communications
   MPI_Comm_group(MPI_COMM_WORLD, &all_group);
-  //exclude[0]=0;
-  //MPI_Group_excl(all_group, 1, exclude, &workers_group);
-  //MPI_Comm_create(MPI_COMM_WORLD, workers_group, &workers_comm);
-  //
   MPI_Comm dup_comm_world;
   MPI_Comm_dup(MPI_COMM_WORLD, &dup_comm_world);
   MPI_Comm_group(dup_comm_world, &workers_group);
@@ -161,10 +141,9 @@ int main(int argc, char *argv[])
     debug_out << "==> Node " << nodeID << " is ready" << endl;
   }
 
-  // node 1 is the master
   if (nodeID == 1)
   {
-    times(&starttime); // load start time into starttime structure
+    times(&starttime);
     print_line();
     cout << "Parameters from file" << endl;
     print_line();
@@ -207,72 +186,44 @@ int main(int argc, char *argv[])
 
   if (nodeID == 1)
   {
-    //
-    // master node
-    //
     for (int node = 1; node < numNodes; node++)
     {
       sprintf(message, "Hello to node %d", node);
       MPI_Send(message, strlen(message), MPI_CHAR, node, HELLO, MPI_COMM_WORLD);
     }
 
-    // master loops and waits for children to report that they are ready to start
     cout << "Receiving hello from nodes on master node..." << endl;
     checksum = 0;
     while (checksum < numNodes - 1)
     {
       MPI_Recv(&done, 1, MPI_INT, MPI_ANY_SOURCE, HELLO, MPI_COMM_WORLD, &status);
       checksum += done;
-      if (debug)
-        debug_out << "Received: hello from computational node" << endl;
     }
-
-    // cluster is ready
-    if (debug)
-      debug_out << "==> Cluster ready" << endl;
     cout << "==> Master node: cluster ready..." << endl;
-
-    // Currently the master process
-    // simply starts and turns into
-    // a usual computational process.
-    //
   }
   else
   {
-    //
-    // computational node
-    //
     MPI_Recv(message, 20, MPI_CHAR, 0, HELLO, MPI_COMM_WORLD, &status);
-    if (debug == DEBUG_FULL)
-      debug_out << "==> Received : " << message << endl;
     done = 1;
     MPI_Send(&done, 1, MPI_INT, 0, HELLO, MPI_COMM_WORLD);
   }
 
-  double time;
-
-  // set initial conditions and get ready for computation
-  // send message to master that we are starting
   MPI_Barrier(workers_comm);
   solveInitialize();
 
-  // the master said hello so now let's get to work
   MPI_Barrier(workers_comm);
   solve();
 
-  // done with main computation, now do any analysis required
   MPI_Barrier(workers_comm);
   solveFinalize();
 
   cout.flush();
   MPI_Barrier(workers_comm);
 
-  // send message to master that we are done
   if (nodeID != 1)
   {
     done = 1;
     MPI_Send(&done, 1, MPI_INT, 0, DONE, MPI_COMM_WORLD);
-
     if (debug)
     {
       debug_out << "==> Goodbye from node " << nodeID << endl;
@@ -281,18 +232,15 @@ int main(int argc, char *argv[])
   }
   else
   {
-    // master loops and waits for children to report that they are done
     checksum = 0;
     while (checksum < numNodes - 1)
     {
       MPI_Recv(&done, 1, MPI_INT, MPI_ANY_SOURCE, DONE, MPI_COMM_WORLD, &status);
       checksum += done;
-      if (debug)
-        debug_out << "Received: checkout from computational node" << endl;
-      sleep(1.0); // sleep 0.1 seconds between checks in order to reduce CPU usage of master
+      sleep(1.0);
     }
 
-    times(&endtime); // load end time into endtime structure
+    times(&endtime);
     cout << "==> User time: " << (endtime.tms_utime - starttime.tms_utime) / ((double)sysconf(_SC_CLK_TCK)) << " seconds" << endl;
     cout << "==> System time: " << (endtime.tms_stime - starttime.tms_stime) / ((double)sysconf(_SC_CLK_TCK)) << " seconds" << endl;
     print_line();
@@ -306,209 +254,210 @@ int main(int argc, char *argv[])
   return 0;
 }
 
-// solve initialize
+/*---------------------------------------------------------------------------*/
+/* OpenVDB Reader & Writer                                                   */
+/*---------------------------------------------------------------------------*/
+
+void loadWaveSpeedsFromVDB(const std::string& vdb_filepath)
+{
+  openvdb::initialize();
+
+  const double C_AIR = 343.0;
+  const double C_BONE = 3000.0;
+
+  // Default entire local grid (including ghost cells) to air speed
+  for (int sx = 0; sx < NUMX + 2; sx++)
+    for (int sy = 0; sy < NUM + 2; sy++)
+      for (int sz = 0; sz < NUM + 2; sz++)
+        c_speed[sx][sy][sz] = C_AIR;
+
+  openvdb::FloatGrid::Ptr grid;
+  try {
+    openvdb::io::File file(vdb_filepath);
+    file.open();
+    openvdb::GridBase::Ptr baseGrid = file.readGrid("density");
+    file.close();
+
+    grid = openvdb::gridPtrCast<openvdb::FloatGrid>(baseGrid);
+    if (!grid) {
+      if (nodeID == 1) std::cerr << "Error: VDB grid 'density' is not a FloatGrid!" << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+  } catch (const openvdb::Exception& e) {
+    if (nodeID == 1) {
+      std::cerr << "Warning: Could not open " << vdb_filepath << " (" << e.what() 
+                << "). Running with uniform air medium." << std::endl;
+    }
+    return;
+  }
+
+  openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
+  openvdb::tools::GridSampler<openvdb::FloatGrid::Accessor, openvdb::tools::BoxSampler>
+      sampler(accessor, grid->transform());
+
+  for (int sx = 1; sx <= NUMX; sx++) {
+    for (int sy = 1; sy <= NUM; sy++) {
+      for (int sz = 1; sz <= NUM; sz++) {
+        int global_x = (nodeID - 1) * NUMX + (sx - 1);
+        int global_y = sy - 1;
+        int global_z = sz - 1;
+
+        openvdb::Vec3R worldPos(global_x * A, global_y * A, global_z * A);
+        float density = sampler.wsSample(worldPos);
+        density = std::max(0.0f, std::min(1.0f, density));
+
+        c_speed[sx][sy][sz] = C_AIR + density * (C_BONE - C_AIR);
+      }
+    }
+  }
+
+  if (nodeID == 1) {
+    std::cout << "==> Successfully mapped OpenVDB density to MPI wave speeds." << std::endl;
+  }
+  int local_solid_voxels = 0;
+  for (int sx = 1; sx <= NUMX; sx++) {
+    for (int sy = 1; sy <= NUM; sy++) {
+      for (int sz = 1; sz <= NUM; sz++) {
+        int global_x = (nodeID - 1) * NUMX + (sx - 1);
+        int global_y = sy - 1;
+        int global_z = sz - 1;
+
+        openvdb::Vec3R worldPos(global_x * A, global_y * A, global_z * A);
+        float density = sampler.wsSample(worldPos);
+        density = std::max(0.0f, std::min(1.0f, density));
+
+        if (density > 0.01f) local_solid_voxels++;
+        c_speed[sx][sy][sz] = C_AIR + density * (C_BONE - C_AIR);
+      }
+    }
+  }
+
+  int total_solid_voxels = 0;
+  MPI_Reduce(&local_solid_voxels, &total_solid_voxels, 1, MPI_INT, MPI_SUM, 0, workers_comm);
+
+  if (nodeID == 1) {
+    openvdb::CoordBBox bbox = grid->evalActiveVoxelBoundingBox();
+    openvdb::Vec3d minWS = grid->indexToWorld(bbox.min());
+    openvdb::Vec3d maxWS = grid->indexToWorld(bbox.max());
+    std::cout << "==> VDB World BBox: [" << minWS.x() << ", " << minWS.y() << ", " << minWS.z() 
+              << "] to [" << maxWS.x() << ", " << maxWS.y() << ", " << maxWS.z() << "]" << std::endl;
+    std::cout << "==> Solver Grid BBox: [0, 0, 0] to [" 
+              << NUM * A << ", " << NUM * A << ", " << NUM * A << "]" << std::endl;
+    std::cout << "==> Solid teapot voxels sampled across MPI ranks: " << total_solid_voxels << std::endl;
+  }
+}
+
+void exportVDBFrame(int frame_number)
+{
+  int local_elements = NUMX * NUM * NUM;
+  std::vector<float> local_slice(local_elements);
+
+  int idx = 0;
+  for (int sx = 1; sx <= NUMX; ++sx) {
+    for (int sy = 1; sy <= NUM; ++sy) {
+      for (int sz = 1; sz <= NUM; ++sz) {
+        local_slice[idx++] = static_cast<float>(real(w[sx][sy][sz]));
+      }
+    }
+  }
+
+  std::vector<float> global_data;
+  if (nodeID == 1) {
+    global_data.resize(NUM * NUM * NUM);
+  }
+
+  MPI_Gather(
+      local_slice.data(), local_elements, MPI_FLOAT,
+      global_data.data(), local_elements, MPI_FLOAT,
+      0, workers_comm
+  );
+
+  if (nodeID == 1) {
+    openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create(0.0f);
+    grid->setTransform(openvdb::math::Transform::createLinearTransform(A));
+    grid->setName("amplitude");
+
+    openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
+
+    int g_idx = 0;
+    for (int x = 0; x < NUM; ++x) {
+      for (int y = 0; y < NUM; ++y) {
+        for (int z = 0; z < NUM; ++z) {
+          // Store rectified magnitude so both positive and negative wave phases glow in Houdini
+          float mag = std::abs(global_data[g_idx++]);
+          if (mag > 1e-4f) {
+            accessor.setValue(openvdb::Coord(x, y, z), mag);
+          }
+        }
+      }
+    }
+
+    char filename[256];
+    sprintf(filename, "%s/frame_%04d.vdb", DATAFOLD, frame_number);
+
+    openvdb::io::File file(filename);
+    openvdb::GridPtrVec grids;
+    grids.push_back(grid);
+    file.write(grids);
+    file.close();
+
+    std::cout << "==> Exported VDB snapshot: " << filename << std::endl;
+  }
+}
+
+/*---------------------------------------------------------------------------*/
+/* Solver Initialization, Loop, and Finalization                             */
+/*---------------------------------------------------------------------------*/
+
 void solveInitialize()
 {
-
-  char label[64];
-
-  // allocate memory
+  // Allocate 3D grids (including c_speed and w_prev in grid.cpp)
   allocateMemory();
 
-  // load the potential
   if (nodeID == 1)
   {
     print_line();
-    cout << "==> Loading Potential Arrays" << endl;
+    cout << "==> Loading OpenVDB Wave Speed Medium" << endl;
     flush(cout);
   }
-  loadPotentialArrays();
+  loadWaveSpeedsFromVDB("input/skull_density.vdb");
 
-  if (nodeID == 1)
-    print_line();
-
-  // set initial conditions
-  setInitialConditions(nodeID);
-
-  // initalize fftw3 library
-  if (KINTERM != 0)
-  {
-
-    fftw_mpi_init();
-
-    fftw_par.alloc_local =
-        fftw_mpi_local_size_3d(NUM, NUM, NUM, workers_comm,
-                               &(fftw_par.local_n0), &(fftw_par.local_0_start));
-
-    fftw_par.in = fftw_alloc_complex(fftw_par.alloc_local);
-    fftw_par.out = fftw_alloc_complex(fftw_par.alloc_local);
-
-    fftw_par.plan_fftw =
-        fftw_mpi_plan_dft_3d(NUM, NUM, NUM, fftw_par.in, fftw_par.out, workers_comm,
-                             FFTW_FORWARD, FFTW_MEASURE); //PATIENT | FFTW_DESTROY_INPUT);
-
-    fftw_par.plan_ifftw =
-        fftw_mpi_plan_dft_3d(NUM, NUM, NUM, fftw_par.in, fftw_par.out, workers_comm,
-                             FFTW_BACKWARD, FFTW_MEASURE); //FFTW_PATIENT | FFTW_DESTROY_INPUT);
-  }
-
-  if (SAVEPOT)
-  {
-    sprintf(label, "%d", nodeID);
-    outputPotential(label);
+  // Initialize acoustic pressure fields (w, W, w_prev) to silence (0.0)
+  for (int sx = 0; sx < NUMX + 2; sx++) {
+    for (int sy = 0; sy < NUM + 2; sy++) {
+      for (int sz = 0; sz < NUM + 2; sz++) {
+        w[sx][sy][sz] = dcomp(0.0, 0.0);
+        W[sx][sy][sz] = dcomp(0.0, 0.0);
+        w_prev[sx][sy][sz] = dcomp(0.0, 0.0);
+      }
+    }
   }
 }
 
-// reduce observables across nodes to first worker node
-void computeObservables(dcomp ***wfnc)
-{
-
-  // sum energy across nodes
-  double energy_re = 0., energy_im = 0.;
-  double energy_re_collect = 0., energy_im_collect = 0.;
-  energy = wfncEnergy(wfnc);
-  energy_re = real(energy);
-  energy_im = imag(energy);
-  MPI_Reduce(&energy_re, &energy_re_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  MPI_Reduce(&energy_im, &energy_im_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  energyCollect = dcomp(energy_re_collect, energy_im_collect);
-
-  // sum normalization squared across nodes
-  double normalization_re = 0., normalization_im = 0.;
-  double normalization_re_collect = 0., normalization_im_collect = 0.;
-  normalization = wfncNorm2(wfnc);
-  normalization_re = real(normalization);
-  normalization_im = imag(normalization);
-  MPI_Reduce(&normalization_re, &normalization_re_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  MPI_Reduce(&normalization_im, &normalization_im_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  normalizationCollect = dcomp(normalization_re_collect, normalization_im_collect);
-
-  // sum expectation across nodes
-  double vInfinity_re = 0., vInfinity_im = 0.;
-  double vInfinity_re_collect = 0., vInfinity_im_collect = 0.;
-  vInfinity = vInfinityExpectationValue(wfnc);
-  vInfinity_re = real(vInfinity);
-  vInfinity_im = imag(vInfinity);
-  MPI_Reduce(&vInfinity_re, &vInfinity_re_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  MPI_Reduce(&vInfinity_im, &vInfinity_im_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  vInfinityCollect = dcomp(vInfinity_re_collect, vInfinity_im_collect);
-
-  // sum r-squared across nodes
-  double rRMS2_re = 0., rRMS2_im = 0.;
-  double rRMS2_re_collect = 0., rRMS2_im_collect = 0.;
-  rRMS2 = r2ExpectationValue(wfnc);
-  rRMS2_re = real(rRMS2);
-  rRMS2_im = imag(rRMS2);
-  MPI_Reduce(&rRMS2_re, &rRMS2_re_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  MPI_Reduce(&rRMS2_im, &rRMS2_im_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  rRMS2Collect = dcomp(rRMS2_re_collect, rRMS2_im_collect);
-
-  // sum x across nodes
-  double x_re = 0., x_im = 0.;
-  double x_re_collect = 0., x_im_collect = 0.;
-  xAvg = xExpectationValue(wfnc);
-  x_re = real(xAvg);
-  x_im = imag(xAvg);
-  MPI_Reduce(&x_re, &x_re_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  MPI_Reduce(&x_im, &x_im_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  xAvgCollect = A * dcomp(x_re_collect, x_im_collect);
-
-  // sum y across nodes
-  double y_re = 0., y_im = 0.;
-  double y_re_collect = 0., y_im_collect = 0.;
-  yAvg = yExpectationValue(wfnc);
-  y_re = real(yAvg);
-  y_im = imag(yAvg);
-  MPI_Reduce(&y_re, &y_re_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  MPI_Reduce(&y_im, &y_im_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  yAvgCollect = A * dcomp(y_re_collect, y_im_collect);
-
-  // sum z across nodes
-  double z_re = 0., z_im = 0.;
-  double z_re_collect = 0., z_im_collect = 0.;
-  zAvg = zExpectationValue(wfnc);
-  z_re = real(zAvg);
-  z_im = imag(zAvg);
-  MPI_Reduce(&z_re, &z_re_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  MPI_Reduce(&z_im, &z_im_collect, 1, MPI_DOUBLE, MPI_SUM, 0, workers_comm);
-  zAvgCollect = A * dcomp(z_re_collect, z_im_collect);
-}
-
-// main computational solve routine
 void solve()
 {
-
-  dcomp energytot, lastenergy = 1.0e10;
-  int step = 0, done = 1;
+  int step = 0;
   bool keep = true;
-  char label[64];
 
   leftSendBuffer = (double *)malloc(2 * (NUM + 2) * (NUM + 2) * sizeof(double));
   rightSendBuffer = (double *)malloc(2 * (NUM + 2) * (NUM + 2) * sizeof(double));
   leftReceiveBuffer = (double *)malloc(2 * (NUM + 2) * (NUM + 2) * sizeof(double));
   rightReceiveBuffer = (double *)malloc(2 * (NUM + 2) * (NUM + 2) * sizeof(double));
 
-  // Check barrier...
   MPI_Barrier(workers_comm);
 
-  // evolve lattice in steps of UPDATE and output data along the way
   do
   {
     keep = (step <= STEPS - UPDATE);
 
-    // sync boundaries
     if (KINTERM == 0)
       syncBoundaries(w);
 
-    // reduce observables across nodes
-    computeObservables(w);
-
-    // output 2d snapshots of the wavefunction for inspection
-    // and check convergence of ground state energy
-    if (step % SNAPUPDATE == 0 || step % SNAPDUMP == 0)
+    if (step % SNAPUPDATE == 0)
     {
-      // broadcast observables
-      MPI_Bcast(&normalizationCollect, 1, MPI_DOUBLE_COMPLEX, 0, workers_comm);
-      MPI_Bcast(&energyCollect, 1, MPI_DOUBLE_COMPLEX, 0, workers_comm);
-      // force symmetry
-      symmetrizeWavefunction();
-      // normalize wavefunction
-      normalizeWavefunction(w);
-      // save ground state energy and tau_f in global variables
-      energytot = energyCollect / normalizationCollect;
-      EGrnd = energytot;
-      timef = step * EPS;
-
-      if (nodeID == 1)
-        outputMeasurements(step * EPS, step);
-
-      if (DUMPSNAPS > 0 && step > 2 * UPDATE && step % SNAPDUMP == 0)
-      {
-        sprintf(label, "%d_0_%d", step, nodeID);
-        outputSnapshot(w, label);
-
-        if (nodeID == 1)
-          outputSummaryData("Ground State", step * EPS, step);
-        if (DUMPSNAPS > 2)
-          findExcitedStates(step * EPS, step);
-      }
-
-      // check convergence and break if tolerance is achieved
-      // otherwise, record snapshot for use in excited state
-      // computation and keep going
-      //
-      if (abs(energytot - lastenergy) < TOLERANCE)
-      {
-        break;
-      }
-      else if (keep)
-      {
-        lastenergy = energytot;
-        // record and output snapshot
-        snapcnt = (snapcnt + 1) % 2; // assume only two snapshots for now, so cycle
-        recordSnapshot(w, snapcnt);
-      }
+      exportVDBFrame(step / SNAPUPDATE);
     }
+
     if (keep)
     {
       evolve(UPDATE);
@@ -516,35 +465,14 @@ void solve()
     }
   } while (keep);
 
-  computeObservables(w);
-  MPI_Bcast(&normalizationCollect, 1, MPI_DOUBLE_COMPLEX, 0, workers_comm);
-  MPI_Bcast(&energyCollect, 1, MPI_DOUBLE_COMPLEX, 0, workers_comm);
-
-  if (nodeID == 1)
-    outputSummaryData("Ground State", step * EPS, step);
-
-  if (debug)
-  {
-    debug_out << "==> Unnormalized Energy : " << energy << endl;
-    debug_out << "==> Normalization2 : " << normalization << endl;
-  }
-
   free(rightSendBuffer);
   free(leftSendBuffer);
   free(rightReceiveBuffer);
   free(leftReceiveBuffer);
-
-  return;
 }
 
-// solve finalize
 void solveFinalize()
 {
-
-  // this routine currently computes the first excited state energy and wavefunction
-  findExcitedStates(real(timef), -1.);
-
-  // this cleans the fftw3 staff
   if (KINTERM != 0)
   {
     fftw_destroy_plan(fftw_par.plan_fftw);
@@ -554,18 +482,17 @@ void solveFinalize()
   }
 }
 
-// evolves solution nsteps
 void evolve(int nsteps)
 {
-
   int leftTest, rightTest;
+  const double FREQ = 343.0 / (8.0 * A);
 
   for (int i = 1; i <= nsteps; i++)
   {
+    global_step++;
 
     if (KINTERM == 0)
     {
-      // receive boundary sync
       leftTest = 1;
       rightTest = 1;
       if (i > 1)
@@ -598,16 +525,14 @@ void evolve(int nsteps)
       }
     }
 
-    // compute kinetic term from w, for update routines.
+    // Compute c^2 * Laplacian(w)
     wfncKinetic(w);
 
-    // first update boundary so that the send can be happening while we update the interior
+    // Update slice boundaries
     updateBoundaries(EPS);
 
     if (KINTERM == 0)
     {
-
-      // wait and make sure send buffers are ready
       if (i > 1)
       {
         if (nodeID < numNodes)
@@ -616,7 +541,6 @@ void evolve(int nsteps)
           MPI_Wait(&leftSend, &leftSendStatus);
       }
 
-      // send boundary sync
       leftTest = 1;
       rightTest = 1;
       if (i == 1)
@@ -650,162 +574,44 @@ void evolve(int nsteps)
       }
     }
 
-    // evolve interior of the grid forward in time by EPS storing updated fields in capital vars
+    // Update interior cells via 2nd-order wave equation
     updateInterior(EPS);
 
-    // copy fields from capital vars (updated) down to lowercase vars (current)
+    // Wavelength locked to 8 voxels in air so it always resolves cleanly on the grid
+    const double wavelength = 8.0 * A;
+    const double FREQ = 343.0 / wavelength;
+    const double SOURCE_AMP = 10.0;
+    const int DISC_RADIUS = 5;
+
+    double current_time = global_step * EPS;
+    double signal = SOURCE_AMP * sin(2.0 * M_PI * FREQ * current_time);
+
+    int center_x = NUM / 2;
+    int center_y = NUM / 2;
+    int sz = NUM - 3; // Near top of Z-axis
+
+    for (int sx = 1; sx <= NUMX; sx++) {
+      int global_x = (nodeID - 1) * NUMX + (sx - 1);
+      int dx = global_x - center_x;
+      for (int sy = 1; sy <= NUM; sy++) {
+        int dy = (sy - 1) - center_y;
+        if (dx * dx + dy * dy <= DISC_RADIUS * DISC_RADIUS) {
+          W[sx][sy][sz] = dcomp(signal, 0.0);
+        }
+      }
+    }
+
+    // Advance time planes: w_prev = w, w = W
     copyDown();
   }
 }
 
 /*---------------------------------------------------------------------------*/
-/* Compute Wavefunction Overlap                                              */
-/*---------------------------------------------------------------------------*/
-
-dcomp computeOverlap(dcomp ***wfnc1, dcomp ***wfnc2)
-{
-  dcomp overlap = 0, overlapCollect = 0;
-  for (int sx = 1; sx <= NUMX; sx++)
-    for (int sy = 1; sy <= NUM; sy++)
-      for (int sz = 1; sz <= NUM; sz++)
-        overlap += conj(wfnc1[sx][sy][sz]) * wfnc2[sx][sy][sz];
-
-  MPI_Reduce(&overlap, &overlapCollect, 1, MPI_DOUBLE_COMPLEX, MPI_SUM, 0, workers_comm);
-  MPI_Bcast(&overlapCollect, 1, MPI_DOUBLE_COMPLEX, 0, workers_comm);
-  return overlapCollect;
-}
-
-/*---------------------------------------------------------------------------*/
-/* Find excited states                                                       */
-/*---------------------------------------------------------------------------*/
-
-void findExcitedStates(const double time, int step)
-{
-
-  char label[64];
-  dcomp ener, dEtau;
-
-  /*---------------------------------------------------------------------------*/
-  /* Find first excited state                                                  */
-  /*---------------------------------------------------------------------------*/
-
-  int snap = snapcnt;
-
-  // compute overlap
-  dcomp overlap = computeOverlap(w, wstore[snap]);
-
-  // subtract overlap
-  for (int sx = 0; sx < NUMX + 2; sx++)
-    for (int sy = 0; sy < NUM + 2; sy++)
-      for (int sz = 0; sz < NUM + 2; sz++)
-        w1[sx][sy][sz] = wstore[snap][sx][sy][sz] - overlap * w[sx][sy][sz];
-
-  // compute observables
-  computeObservables(w1);
-
-  // normalize
-  MPI_Bcast(&normalizationCollect, 1, MPI_DOUBLE, 0, workers_comm);
-  normalizeWavefunction(w1);
-
-  if (DUMPSNAPS > 0 && step > 0)
-  {
-    // output snapshot of excited states
-    sprintf(label, "%d_1_%d", step, nodeID);
-    outputSnapshot(w1, label);
-  }
-
-  if (nodeID == 1)
-  {
-
-    outputSummaryData("First Excited State", time, step);
-
-    // consistency check and warning if fail
-    ener = energyCollect / normalizationCollect;
-    dEtau = (ener - EGrnd) * timef;
-    if (real(dEtau) < 4.)
-    {
-      print_line();
-      cout << "==> WARNING: states nearly degenerate, tau_f too small!" << endl;
-      print_line();
-    }
-  }
-  EGrnd = ener; // redfine EGrnd to hold energy of first excited state for comparison below
-
-  /*---------------------------------------------------------------------------*/
-  /* Find second excited state                                                 */
-  /*---------------------------------------------------------------------------*/
-
-  int save = snap;
-  snap = (snapcnt + 1) % 2;
-
-  // compute overlap
-  overlap = computeOverlap(wstore[snap], w);
-  dcomp overlap2 = computeOverlap(wstore[snap], w1);
-
-  // subtract overlap
-  for (int sx = 0; sx < NUMX + 2; sx++)
-    for (int sy = 0; sy < NUM + 2; sy++)
-      for (int sz = 0; sz < NUM + 2; sz++)
-        w2[sx][sy][sz] = wstore[snap][sx][sy][sz] - overlap * w[sx][sy][sz] - overlap2 * w1[sx][sy][sz];
-
-  // compute observables
-  computeObservables(w2);
-
-  // normalize
-  MPI_Bcast(&normalizationCollect, 1, MPI_DOUBLE, 0, workers_comm);
-  normalizeWavefunction(w2);
-
-  if (DUMPSNAPS > 0 && step > 0)
-  {
-    // output snapshot of excited states
-    sprintf(label, "%d_2_%d", step, nodeID);
-    outputSnapshot(w2, label);
-  }
-
-  if (nodeID == 1)
-  {
-
-    outputSummaryData("Second Excited State", time, step);
-
-    // consistency check and warning if fail
-    ener = energyCollect / normalizationCollect;
-    dEtau = (ener - EGrnd) * timef;
-    if (real(dEtau) < 4.)
-    {
-      print_line();
-      cout << "==> WARNING: states nearly degenerate, tau_f too small!" << endl;
-      print_line();
-    }
-  }
-
-  /*---------------------------------------------------------------------------*/
-  /* Save extracted wavefunctions                                              */
-  /*---------------------------------------------------------------------------*/
-
-  if (SAVEWAVEFNCS && step < 0)
-  {
-    // save 3d wavefunction for extracted states
-    sprintf(label, "0_%d", nodeID);
-    outputWavefunction(w, label);
-    // For now only output ground state, NFS causes delays for writes and this eats time
-
-    sprintf(label, "1_%d", nodeID);
-    outputWavefunction(w1, label);
-    sprintf(label, "2_%d", nodeID);
-    outputWavefunction(w2, label);
-  }
-
-  return;
-}
-
-/*---------------------------------------------------------------------------*/
-/* Boundary sync routines                                                    */
+/* Boundary Sync & Spatial Derivatives                                       */
 /*---------------------------------------------------------------------------*/
 
 void syncBoundaries(dcomp ***wfnc)
 {
-
-  // initiate sends and receives
   if (nodeID < numNodes)
   {
     sendRightBoundary(wfnc);
@@ -817,7 +623,6 @@ void syncBoundaries(dcomp ***wfnc)
     receiveLeftBoundary();
   }
 
-  // now wait for communications to complete and sync wfnc when they do
   if (nodeID < numNodes)
   {
     MPI_Wait(&rightReceive, &rightReceiveStatus);
@@ -834,13 +639,6 @@ void syncBoundaries(dcomp ***wfnc)
 
 void sendRightBoundary(dcomp ***wfnc)
 {
-  char message[64];
-  if (debug == DEBUG_FULL)
-  {
-    sprintf(message, "%d -> %d", nodeID, nodeID + 1);
-    debug_out << "==> Sending : " << message << endl;
-    MPI_Isend(message, strlen(message), MPI_CHAR, nodeID, SYNC_RIGHT_MESSAGE, MPI_COMM_WORLD, &rightMessageSend);
-  }
   for (int sy = 0; sy < NUM + 2; sy++)
     for (int sz = 0; sz < NUM + 2; sz++)
     {
@@ -852,13 +650,6 @@ void sendRightBoundary(dcomp ***wfnc)
 
 void sendLeftBoundary(dcomp ***wfnc)
 {
-  char message[64];
-  if (debug == DEBUG_FULL)
-  {
-    sprintf(message, "%d -> %d", nodeID, nodeID - 1);
-    debug_out << "==> Sending : " << message << endl;
-    MPI_Isend(message, strlen(message), MPI_CHAR, nodeID - 2, SYNC_LEFT_MESSAGE, MPI_COMM_WORLD, &leftMessageSend);
-  }
   for (int sy = 0; sy < NUM + 2; sy++)
     for (int sz = 0; sz < NUM + 2; sz++)
     {
@@ -870,18 +661,11 @@ void sendLeftBoundary(dcomp ***wfnc)
 
 void receiveRightBoundary()
 {
-  char message[64];
-  if (debug == DEBUG_FULL)
-  {
-    MPI_Irecv(message, 255, MPI_CHAR, nodeID, SYNC_LEFT_MESSAGE, MPI_COMM_WORLD, &rightMessageReceive);
-    debug_out << "==> Received : " << message << endl;
-  }
   MPI_Irecv(rightReceiveBuffer, 2 * (NUM + 2) * (NUM + 2), MPI_DOUBLE, nodeID, SYNC_LEFT, MPI_COMM_WORLD, &rightReceive);
 }
 
 inline void loadRightBoundaryFromBuffer(dcomp ***wfnc)
 {
-  // update w array right boundary
   for (int sy = 0; sy < NUM + 2; sy++)
     for (int sz = 0; sz < NUM + 2; sz++)
       wfnc[NUMX + 1][sy][sz] = dcomp(rightReceiveBuffer[sy * (NUM + 2) + sz % (NUM + 2)], rightReceiveBuffer[sy * (NUM + 2) + sz % (NUM + 2) + (NUM + 2) * (NUM + 2)]);
@@ -889,18 +673,11 @@ inline void loadRightBoundaryFromBuffer(dcomp ***wfnc)
 
 void receiveLeftBoundary()
 {
-  char message[64];
-  if (debug == DEBUG_FULL)
-  {
-    MPI_Irecv(message, 255, MPI_CHAR, nodeID - 2, SYNC_RIGHT_MESSAGE, MPI_COMM_WORLD, &leftMessageReceive);
-    debug_out << "==> Received : " << message << endl;
-  }
   MPI_Irecv(leftReceiveBuffer, 2 * (NUM + 2) * (NUM + 2), MPI_DOUBLE, nodeID - 2, SYNC_RIGHT, MPI_COMM_WORLD, &leftReceive);
 }
 
 inline void loadLeftBoundaryFromBuffer(dcomp ***wfnc)
 {
-  // update w array left boundary
   for (int sy = 0; sy < NUM + 2; sy++)
     for (int sz = 0; sz < NUM + 2; sz++)
       wfnc[0][sy][sz] = dcomp(leftReceiveBuffer[sy * (NUM + 2) + sz % (NUM + 2)], leftReceiveBuffer[sy * (NUM + 2) + sz % (NUM + 2) + (NUM + 2) * (NUM + 2)]);
@@ -908,130 +685,33 @@ inline void loadLeftBoundaryFromBuffer(dcomp ***wfnc)
 
 void wfncKinetic(dcomp ***wfnc)
 {
-  bool N_EVEN;
-
   switch (KINTERM)
   {
+  case 0: // 3D ACOUSTIC WAVE EQUATION SPATIAL OPERATOR: c(x,y,z)^2 * Laplacian(P)
+    for (int sx = 1; sx <= NUMX; sx++) {
+      for (int sy = 1; sy <= NUM; sy++) {
+        for (int sz = 1; sz <= NUM; sz++) {
+          double local_c = c_speed[sx][sy][sz];
+          double c_sq = local_c * local_c;
 
-  case 0: // NON RELATIVISTIC, FINITE DIREFENCES
-    for (int sx = 1; sx <= NUMX; sx++)
-      for (int sy = 1; sy <= NUM; sy++)
-        for (int sz = 1; sz <= NUM; sz++)
-          t_kin[sx][sy][sz] = -(wfnc[sx + 1][sy][sz] + wfnc[sx - 1][sy][sz] +
-                                wfnc[sx][sy + 1][sz] + wfnc[sx][sy - 1][sz] +
-                                wfnc[sx][sy][sz + 1] + wfnc[sx][sy][sz - 1] -
-                                ((dcomp)6.) * wfnc[sx][sy][sz]) /
-                              (((dcomp)2.) * A * A * MASS);
+          dcomp laplacian = (wfnc[sx + 1][sy][sz] + wfnc[sx - 1][sy][sz] +
+                             wfnc[sx][sy + 1][sz] + wfnc[sx][sy - 1][sz] +
+                             wfnc[sx][sy][sz + 1] + wfnc[sx][sy][sz - 1] -
+                             ((dcomp)6.) * wfnc[sx][sy][sz]) / (A * A);
 
-    break;
-
-  case 1: // FFTW: NON RELATIVISTIC
-  case 2: // FFTW: NON RELATIVISTIC, WITH SIN(k)
-  case 3: // FFTW: RELATIVISTIC
-
-    N_EVEN = NUM % 2 == 0;
-
-    if (fftw_par.local_0_start != NUMX * (nodeID - 1))
-    {
-      cout << "ERROR: BAD ALIGNMENT!!!" << endl;
-      exit(1);
+          t_kin[sx][sy][sz] = c_sq * laplacian;
+        }
+      }
     }
-
-    MPI_Barrier(workers_comm);
-
-    for (int i = 0; i < fftw_par.local_n0; ++i)
-      for (int j = 0; j < NUM; ++j)
-        for (int k = 0; k < NUM; ++k)
-          dcomp_to_fftw(wfnc[i + 1][j + 1][k + 1], &fftw_par.in[i * NUM * NUM + j * NUM + k]);
-
-    MPI_Barrier(workers_comm);
-    fftw_execute(fftw_par.plan_fftw);
-    MPI_Barrier(workers_comm);
-
-    for (int i = 0; i < fftw_par.local_n0; ++i)
-      for (int j = 0; j < NUM; ++j)
-        for (int k = 0; k < NUM; ++k)
-        {
-          dcomp v_ft;
-          double tmp;
-          int ki, kj, kk;
-
-          ki = fftw_par.local_0_start + i;
-          kj = j;
-          kk = k;
-
-          if (2 * ki > NUM)
-            ki -= NUM;
-          if (2 * kj > NUM)
-            kj -= NUM;
-          if (2 * kk > NUM)
-            kk -= NUM;
-
-          // if (N_EVEN){
-          //   if (2*ki==NUM) ki=0;
-          //   if (2*kj==NUM) kj=0;
-          //   if (2*kk==NUM) kk=0;
-          // }
-
-          fftw_to_dcomp(fftw_par.out[i * NUM * NUM + j * NUM + k], &v_ft);
-
-          switch (KINTERM)
-          {
-
-          case 1:
-            tmp = pow2(2. * M_PI * ((double)ki) / ((double)NUM))
-                    + pow2(2. * M_PI * ((double)kj) / ((double)NUM))
-                    + pow2(2. * M_PI * ((double)kk) / ((double)NUM));
-
-            tmp /= (A * A) * ((double)(NUM * NUM * NUM));
-            tmp /= (double)2. * MASS;
-            break;
-
-          case 2:
-            tmp = 4. * pow2(sin(M_PI * ((double)ki) / ((double)NUM)))
-                    + 4. * pow2(sin(M_PI * ((double)kj) / ((double)NUM)))
-                    + 4. * pow2(sin(M_PI * ((double)kk) / ((double)NUM)));
-
-            tmp /= (A * A) * ((double)(NUM * NUM * NUM));
-            tmp /= (double)2. * MASS;
-            break;
-
-          case 3:
-            tmp = 4. * pow2(sin(M_PI * ((double)ki) / ((double)NUM)))
-                    + 4. * pow2(sin(M_PI * ((double)kj) / ((double)NUM)))
-                    + 4. * pow2(sin(M_PI * ((double)kk) / ((double)NUM)));
-
-            tmp = sqrt(tmp + MASS * MASS * A * A) / (A * ((double)(NUM * NUM * NUM)));
-
-            break;
-
-          default:
-            cerr << " >> FATAL ERROR INSIDE void wfncKinetic(dcomp ***wfnc) " << endl;
-            exit(1);
-          }
-
-          v_ft = v_ft * dcomp(tmp, 0.);
-
-          dcomp_to_fftw(v_ft, &(fftw_par.in[i * NUM * NUM + j * NUM + k]));
-        }
-
-    MPI_Barrier(workers_comm);
-    fftw_execute(fftw_par.plan_ifftw);
-    MPI_Barrier(workers_comm);
-
-    for (int i = 0; i < fftw_par.local_n0; ++i)
-      for (int j = 0; j < NUM; ++j)
-        for (int k = 0; k < NUM; ++k)
-        {
-          fftw_to_dcomp(fftw_par.out[i * NUM * NUM + j * NUM + k], &(t_kin[i + 1][j + 1][k + 1]));
-        }
-
     break;
 
   default:
-    cerr << " >> FATAL ERROR!!! UNVALID KINTERM = " << KINTERM << " PARAMETER." << endl;
+    cerr << " >> FATAL ERROR: Set KINTERM = 0 for FDTD acoustic solver." << endl;
     exit(1);
   }
-
-  MPI_Barrier(workers_comm);
 }
+
+// Stubs retained if referenced by other headers
+void computeObservables(dcomp ***wfnc) {}
+void findExcitedStates(const double time, int step) {}
+dcomp computeOverlap(dcomp ***wfnc1, dcomp ***wfnc2) { return dcomp(0.0, 0.0); }

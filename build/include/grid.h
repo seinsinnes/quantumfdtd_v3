@@ -39,6 +39,9 @@ extern dcomp ***t_kin;
 // these hold the alpha and beta arrays which are used during updates
 extern dcomp ***a, ***b;
 
+extern dcomp ***w_prev;
+extern double ***c_speed;
+
 // number of snapshots to capture in memory
 extern int nsnaps;
 

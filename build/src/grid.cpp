@@ -53,12 +53,32 @@ dcomp ***a, ***b;
 // temp for point swap
 dcomp ***tmp;
 
+dcomp ***w_prev;
+double ***c_speed;
+
 // allocate memory arrays
 void allocateMemory()
 {
 
     // cout << "==> Allocating memory\n";
     // indices x,y,z
+
+    w_prev = new dcomp **[NUMX + 2];
+    for (int sx = 0; sx < NUMX + 2; sx++)
+        w_prev[sx] = new dcomp *[NUM + 2];
+    for (int sx = 0; sx < NUMX + 2; sx++)
+        for (int sy = 0; sy < NUM + 2; sy++)
+            w_prev[sx][sy] = new dcomp[NUM + 2];
+
+    double* flat_c_speed = new double[(NUMX + 2) * (NUM + 2) * (NUM + 2)];
+    c_speed = new double**[NUMX + 2];
+    for (int sx = 0; sx < NUMX + 2; sx++) {
+        c_speed[sx] = new double*[NUM + 2];
+        for (int sy = 0; sy < NUM + 2; sy++) {
+            int offset = (sx * (NUM + 2) * (NUM + 2)) + (sy * (NUM + 2));
+            c_speed[sx][sy] = flat_c_speed + offset;
+        }
+    }
 
     w = new dcomp **[NUMX + 2];
     for (int sx = 0; sx < NUMX + 2; sx++)
@@ -144,9 +164,14 @@ void allocateMemory()
 // "copies" updated arrays using pointer swap
 void copyDown()
 {
-    tmp = w;
-    w = W;
-    W = tmp;
+  for (int sx = 1; sx <= NUMX; sx++) {
+    for (int sy = 1; sy <= NUM; sy++) {
+      for (int sz = 1; sz <= NUM; sz++) {
+        w_prev[sx][sy][sz] = w[sx][sy][sz];
+        w[sx][sy][sz] = W[sx][sy][sz];
+      }
+    }
+  }
 }
 
 // initializes the potentials from potential.cpp
@@ -302,37 +327,38 @@ inline dcomp updateRule(int sx, int sy, int sz, double step)
 
 // load updated left and right boundaries into W,
 // CALL wfncKinetic(w) FIRST!!!
-void updateBoundaries(double step)
+void updateBoundaries(double dt)
 {
-
-    for (int sx = 1; sx <= NUMX; sx += NUMX - 1)
-        for (int sy = 0; sy < NUM + 2; sy++)
-            for (int sz = 0; sz < NUM + 2; sz++)
-            {
-                if (sy >= 1 && sy <= NUM && sz >= 1 && sz <= NUM)
-                    W[sx][sy][sz] = updateRule(sx, sy, sz, step);
-                else
-                    W[sx][sy][sz] = w[sx][sy][sz];
-            }
+  double dt_sq = dt * dt;
+  int sx_list[2] = {1, NUMX};
+  for (int idx = 0; idx < 2; idx++) {
+    int sx = sx_list[idx];
+    for (int sy = 1; sy <= NUM; sy++) {
+      for (int sz = 1; sz <= NUM; sz++) {
+        double p_next = 2.0 * real(w[sx][sy][sz])
+                      - real(w_prev[sx][sy][sz])
+                      + dt_sq * real(t_kin[sx][sy][sz]);
+        W[sx][sy][sz] = dcomp(p_next, 0.0);
+      }
+    }
+  }
 }
 
 // update the grid; note you should always call updatedBondaries before calling this routine
 // CALL wfncKinetic(w) FIRST!!!
-void updateInterior(double step)
+void updateInterior(double dt)
 {
-
-    for (int sx = 0; sx < NUMX + 2; sx++)
-        for (int sy = 0; sy < NUM + 2; sy++)
-            for (int sz = 0; sz < NUM + 2; sz++)
-            {
-                // no need to update the two slices which were already loaded by updatedBoundaries
-                if (sx == 1 || sx == NUMX)
-                    continue;
-                if (sx >= 1 && sx <= NUMX && sy >= 1 && sy <= NUM && sz >= 1 && sz <= NUM)
-                    W[sx][sy][sz] = updateRule(sx, sy, sz, step);
-                else
-                    W[sx][sy][sz] = w[sx][sy][sz];
-            }
+  double dt_sq = dt * dt;
+  for (int sx = 2; sx <= NUMX - 1; sx++) {
+    for (int sy = 1; sy <= NUM; sy++) {
+      for (int sz = 1; sz <= NUM; sz++) {
+        double p_next = 2.0 * real(w[sx][sy][sz])
+                      - real(w_prev[sx][sy][sz])
+                      + dt_sq * real(t_kin[sx][sy][sz]);
+        W[sx][sy][sz] = dcomp(p_next, 0.0);
+      }
+    }
+  }
 }
 
 void recordSnapshot(dcomp ***wfnc, int snap)

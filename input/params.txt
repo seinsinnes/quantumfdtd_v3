@@ -9,7 +9,7 @@ A		0.301
 
 // temporal grid spacing - should be proportional to A*A, with the proportionality
 //                         constant determined empirically
-EPS		.002
+EPS		0.000045
 
 // convergence tolerance for ground state energy
 // negative value for disabling the tolerance condition,
