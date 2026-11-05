@@ -74,6 +74,30 @@ void setParameter(const char *key, const char *value)
         TOLERANCE = atof(value);
     if (strcmp(key, "POTFLATR") == 0)
         POTFLATR = atof(value);
+
+    if (strcmp(key, "C_MEDIUM") == 0) {
+        C_MEDIUM = atof(value);
+    } else if (strcmp(key, "C_OBJECT") == 0) {
+        C_OBJECT = atof(value);
+    } else if (strcmp(key, "FREQ") == 0) {
+        FREQ = atof(value);
+    } else if (strcmp(key, "WAVELENGTH") == 0) {
+        WAVELENGTH = atof(value);
+    } else if (strcmp(key, "SOURCE_AMP") == 0) {
+        SOURCE_AMP = atof(value);
+    } else if (strcmp(key, "BEAM_RADIUS") == 0) {
+        BEAM_RADIUS = atoi(value);
+    } else if (strcmp(key, "SPONGE") == 0) {
+        SPONGE = atoi(value);
+    } else if (strcmp(key, "SPONGE_DAMP") == 0) {
+        SPONGE_DAMP = atof(value);
+    } else if (strcmp(key, "VDBFILE") == 0) {
+        VDBFILE = strdup(value);
+    } else if (strcmp(key, "AUTO_ALIGN") == 0) {
+        AUTO_ALIGN = atoi(value);
+    } else if (strcmp(key, "OBJECT_FILL") == 0) {
+        OBJECT_FILL = atof(value);
+    }
     return;
 }
 

@@ -47,6 +47,17 @@ int SAVEPOT = 0;
 int SAVEDECAY = 0;
 double POTCRITR = 3., POTFLATR = -1.;
 
+// Acoustic Helmholtz Renderer defaults (overridden by input/params.txt)
+double C_MEDIUM    = 1500.0;  // Background wave speed (m/s)
+double C_OBJECT    = 950.0;   // Object wave speed (m/s)
+double FREQ        = 0.0;     // Frequency in Hz (0 = auto-derive from WAVELENGTH)
+double WAVELENGTH  = 4.0;     // Target wavelength in voxels when FREQ <= 0
+double SOURCE_AMP  = 1.5;     // Source pressure amplitude
+int    BEAM_RADIUS = 20;      // Transducer radius in voxels
+int    SPONGE      = 8;       // Absorbing wall thickness in voxels
+double SPONGE_DAMP = 0.15;    // Absorbing wall damping factor
+char  *VDBFILE     = NULL;    // Input VDB path
+
 // MPI variables
 int nodeID, tmpnodeID, numNodes;
 
@@ -101,6 +112,13 @@ dcomp yAvg = 0, yAvgCollect = 0;
 dcomp zAvg = 0, zAvgCollect = 0;
 dcomp EGrnd, timef;
 int snapcnt = -1;
+
+int    AUTO_ALIGN  = 1;       // Auto-center and scale input VDB bounding box
+double OBJECT_FILL = 0.65;    // Object spans 65% of the NUM grid along its longest axis
+
+// Shared transform mapping solver voxel indices [0..NUM-1] <-> Houdini World Space
+double         vdb_world_step = 0.01;
+openvdb::Vec3d vdb_world_origin(0.0, 0.0, 0.0);
 
 void computeObservables(dcomp ***wfnc);
 void loadWaveSpeedsFromVDB(const std::string& vdb_filepath);
@@ -262,14 +280,15 @@ void loadWaveSpeedsFromVDB(const std::string& vdb_filepath)
 {
   openvdb::initialize();
 
-  const double C_AIR = 343.0;
-  const double C_BONE = 3000.0;
-
-  // Default entire local grid (including ghost cells) to air speed
+  // Default entire local grid (including ghost cells) to background medium speed
   for (int sx = 0; sx < NUMX + 2; sx++)
     for (int sy = 0; sy < NUM + 2; sy++)
       for (int sz = 0; sz < NUM + 2; sz++)
-        c_speed[sx][sy][sz] = C_AIR;
+        c_speed[sx][sy][sz] = C_MEDIUM;
+
+  // Fallback transform if VDB is missing or AUTO_ALIGN == 0
+  vdb_world_step = A;
+  vdb_world_origin = openvdb::Vec3d(0.0, 0.0, 0.0);
 
   openvdb::FloatGrid::Ptr grid;
   try {
@@ -286,34 +305,41 @@ void loadWaveSpeedsFromVDB(const std::string& vdb_filepath)
   } catch (const openvdb::Exception& e) {
     if (nodeID == 1) {
       std::cerr << "Warning: Could not open " << vdb_filepath << " (" << e.what() 
-                << "). Running with uniform air medium." << std::endl;
+                << "). Running with uniform medium." << std::endl;
     }
     return;
+  }
+
+  // Compute active world-space bounding box of the input VDB
+  openvdb::CoordBBox bbox = grid->evalActiveVoxelBoundingBox();
+  if (!bbox.empty() && AUTO_ALIGN != 0) {
+    openvdb::Vec3d p0 = grid->indexToWorld(bbox.min());
+    openvdb::Vec3d p1 = grid->indexToWorld(bbox.max());
+
+    openvdb::Vec3d minWS(std::min(p0.x(), p1.x()), std::min(p0.y(), p1.y()), std::min(p0.z(), p1.z()));
+    openvdb::Vec3d maxWS(std::max(p0.x(), p1.x()), std::max(p0.y(), p1.y()), std::max(p0.z(), p1.z()));
+
+    openvdb::Vec3d centerWS = 0.5 * (minWS + maxWS);
+    openvdb::Vec3d extentWS = maxWS - minWS;
+    double max_extent = std::max({extentWS.x(), extentWS.y(), extentWS.z()});
+
+    if (max_extent > 1e-9) {
+      double clamped_fill = std::max(0.1, std::min(0.9, OBJECT_FILL));
+      double target_voxels = clamped_fill * (NUM - 1);
+
+      // World distance per solver voxel
+      vdb_world_step = max_extent / target_voxels;
+
+      // Map solver grid center ((NUM-1)/2, (NUM-1)/2, (NUM-1)/2) to VDB centerWS
+      double half_grid = 0.5 * (NUM - 1);
+      vdb_world_origin = centerWS - vdb_world_step * openvdb::Vec3d(half_grid, half_grid, half_grid);
+    }
   }
 
   openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
   openvdb::tools::GridSampler<openvdb::FloatGrid::Accessor, openvdb::tools::BoxSampler>
       sampler(accessor, grid->transform());
 
-  for (int sx = 1; sx <= NUMX; sx++) {
-    for (int sy = 1; sy <= NUM; sy++) {
-      for (int sz = 1; sz <= NUM; sz++) {
-        int global_x = (nodeID - 1) * NUMX + (sx - 1);
-        int global_y = sy - 1;
-        int global_z = sz - 1;
-
-        openvdb::Vec3R worldPos(global_x * A, global_y * A, global_z * A);
-        float density = sampler.wsSample(worldPos);
-        density = std::max(0.0f, std::min(1.0f, density));
-
-        c_speed[sx][sy][sz] = C_AIR + density * (C_BONE - C_AIR);
-      }
-    }
-  }
-
-  if (nodeID == 1) {
-    std::cout << "==> Successfully mapped OpenVDB density to MPI wave speeds." << std::endl;
-  }
   int local_solid_voxels = 0;
   for (int sx = 1; sx <= NUMX; sx++) {
     for (int sy = 1; sy <= NUM; sy++) {
@@ -322,12 +348,18 @@ void loadWaveSpeedsFromVDB(const std::string& vdb_filepath)
         int global_y = sy - 1;
         int global_z = sz - 1;
 
-        openvdb::Vec3R worldPos(global_x * A, global_y * A, global_z * A);
+        // Map solver index (global_x, global_y, global_z) into VDB world space
+        openvdb::Vec3R worldPos(
+            vdb_world_origin.x() + global_x * vdb_world_step,
+            vdb_world_origin.y() + global_y * vdb_world_step,
+            vdb_world_origin.z() + global_z * vdb_world_step
+        );
+
         float density = sampler.wsSample(worldPos);
         density = std::max(0.0f, std::min(1.0f, density));
 
         if (density > 0.01f) local_solid_voxels++;
-        c_speed[sx][sy][sz] = C_AIR + density * (C_BONE - C_AIR);
+        c_speed[sx][sy][sz] = C_MEDIUM + density * (C_OBJECT - C_MEDIUM);
       }
     }
   }
@@ -336,14 +368,15 @@ void loadWaveSpeedsFromVDB(const std::string& vdb_filepath)
   MPI_Reduce(&local_solid_voxels, &total_solid_voxels, 1, MPI_INT, MPI_SUM, 0, workers_comm);
 
   if (nodeID == 1) {
-    openvdb::CoordBBox bbox = grid->evalActiveVoxelBoundingBox();
     openvdb::Vec3d minWS = grid->indexToWorld(bbox.min());
     openvdb::Vec3d maxWS = grid->indexToWorld(bbox.max());
-    std::cout << "==> VDB World BBox: [" << minWS.x() << ", " << minWS.y() << ", " << minWS.z() 
+    openvdb::Vec3d domMax = vdb_world_origin + vdb_world_step * openvdb::Vec3d(NUM, NUM, NUM);
+
+    std::cout << "==> Input VDB World BBox : [" << minWS.x() << ", " << minWS.y() << ", " << minWS.z() 
               << "] to [" << maxWS.x() << ", " << maxWS.y() << ", " << maxWS.z() << "]" << std::endl;
-    std::cout << "==> Solver Grid BBox: [0, 0, 0] to [" 
-              << NUM * A << ", " << NUM * A << ", " << NUM * A << "]" << std::endl;
-    std::cout << "==> Solid teapot voxels sampled across MPI ranks: " << total_solid_voxels << std::endl;
+    std::cout << "==> Mapped Solver BBox   : [" << vdb_world_origin.x() << ", " << vdb_world_origin.y() << ", " << vdb_world_origin.z()
+              << "] to [" << domMax.x() << ", " << domMax.y() << ", " << domMax.z() << "]" << std::endl;
+    std::cout << "==> Solid object voxels sampled across MPI ranks: " << total_solid_voxels << std::endl;
   }
 }
 
@@ -374,7 +407,13 @@ void exportVDBFrame(int frame_number)
 
   if (nodeID == 1) {
     openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create(0.0f);
-    grid->setTransform(openvdb::math::Transform::createLinearTransform(A));
+
+    // Apply the exact world-space scale and translation of the input geometry
+    openvdb::math::Transform::Ptr xform =
+        openvdb::math::Transform::createLinearTransform(vdb_world_step);
+    xform->postTranslate(vdb_world_origin);
+    grid->setTransform(xform);
+
     grid->setName("amplitude");
 
     openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
@@ -411,18 +450,54 @@ void exportVDBFrame(int frame_number)
 
 void solveInitialize()
 {
-  // Allocate 3D grids (including c_speed and w_prev in grid.cpp)
   allocateMemory();
+
+  if (!VDBFILE)
+    VDBFILE = strdup("input/skull_density.vdb");
+
+  // Auto-calculate frequency from voxel wavelength if FREQ is not explicitly set
+  if (FREQ <= 0.0) {
+    FREQ = C_MEDIUM / (WAVELENGTH * A);
+  }
 
   if (nodeID == 1)
   {
+    double c_max = std::max(C_MEDIUM, C_OBJECT);
+    double c_min = std::min(C_MEDIUM, C_OBJECT);
+    double cfl_max_dt = A / (c_max * sqrt(3.0));
+    double min_voxels_per_wave = (c_min / FREQ) / A;
+
     print_line();
-    cout << "==> Loading OpenVDB Wave Speed Medium" << endl;
+    cout << "==> Acoustic Solver Configuration:" << endl;
+    cout << "    VDB Geometry File : " << VDBFILE << endl;
+    cout << "    Wave Speeds       : Medium = " << C_MEDIUM << " m/s, Object = " << C_OBJECT << " m/s" << endl;
+    cout << "    Transducer        : Freq = " << FREQ << " Hz, Amp = " << SOURCE_AMP 
+         << ", Radius = " << BEAM_RADIUS << " voxels" << endl;
+    cout << "    Wall Absorption   : Sponge = " << SPONGE << " voxels, Damp = " << SPONGE_DAMP << endl;
+    cout << "    Resolution Check  : " << min_voxels_per_wave << " voxels/wavelength (min)" << endl;
+    cout << "    CFL Stability     : EPS = " << EPS << " s (Max safe EPS = " << cfl_max_dt << " s)" << endl;
+
+    if (EPS > cfl_max_dt) {
+      cerr << "WARNING: EPS exceeds CFL limit! Simulation will explode into NaNs." << endl;
+    }
+    if (min_voxels_per_wave < 2.5) {
+      cerr << "WARNING: Wavelength is under-resolved (< 2.5 voxels). Wave will be evanescent!" << endl;
+    }
+
+    double s_min = c_min * EPS / A;
+    double sin_arg = sin(M_PI * FREQ * EPS) / s_min;
+
+    if (sin_arg >= 1.0 || min_voxels_per_wave < 4.5) {
+      cerr << "WARNING: Wavelength inside object (" << min_voxels_per_wave 
+           << " voxels) is below the 2nd-order FDTD dispersion limit (< 4.5 voxels)!" << endl;
+    }
+
+    print_line();
     flush(cout);
   }
-  loadWaveSpeedsFromVDB("input/skull_density.vdb");
 
-  // Initialize acoustic pressure fields (w, W, w_prev) to silence (0.0)
+  loadWaveSpeedsFromVDB(VDBFILE);
+
   for (int sx = 0; sx < NUMX + 2; sx++) {
     for (int sy = 0; sy < NUM + 2; sy++) {
       for (int sz = 0; sz < NUM + 2; sz++) {
@@ -485,7 +560,6 @@ void solveFinalize()
 void evolve(int nsteps)
 {
   int leftTest, rightTest;
-  const double FREQ = 343.0 / (8.0 * A);
 
   for (int i = 1; i <= nsteps; i++)
   {
@@ -577,25 +651,41 @@ void evolve(int nsteps)
     // Update interior cells via 2nd-order wave equation
     updateInterior(EPS);
 
-    // Wavelength locked to 8 voxels in air so it always resolves cleanly on the grid
-    const double wavelength = 8.0 * A;
-    const double FREQ = 343.0 / wavelength;
-    const double SOURCE_AMP = 10.0;
-    const int DISC_RADIUS = 5;
+    // 1. Configurable Absorbing Boundary Sponge Layer
+    if (SPONGE > 0) {
+      for (int sx = 1; sx <= NUMX; sx++) {
+        int gx = (nodeID - 1) * NUMX + (sx - 1);
+        for (int sy = 1; sy <= NUM; sy++) {
+          int gy = sy - 1;
+          for (int sz = 1; sz <= NUM; sz++) {
+            int gz = sz - 1;
 
+            int d_min = std::min({gx, NUM - 1 - gx, gy, NUM - 1 - gy, gz, NUM - 1 - gz});
+            if (d_min < SPONGE) {
+              double norm_d = static_cast<double>(SPONGE - d_min) / SPONGE;
+              double damp = exp(-SPONGE_DAMP * norm_d * norm_d);
+              W[sx][sy][sz] *= damp;
+              w[sx][sy][sz] *= damp;
+            }
+          }
+        }
+      }
+    }
+
+    // 2. Configurable Disc Transducer Source
     double current_time = global_step * EPS;
     double signal = SOURCE_AMP * sin(2.0 * M_PI * FREQ * current_time);
 
     int center_x = NUM / 2;
     int center_y = NUM / 2;
-    int sz = NUM - 3; // Near top of Z-axis
+    int sz = std::max(1, NUM - SPONGE - 1); // Place just inside the top sponge boundary
 
     for (int sx = 1; sx <= NUMX; sx++) {
       int global_x = (nodeID - 1) * NUMX + (sx - 1);
       int dx = global_x - center_x;
       for (int sy = 1; sy <= NUM; sy++) {
         int dy = (sy - 1) - center_y;
-        if (dx * dx + dy * dy <= DISC_RADIUS * DISC_RADIUS) {
+        if (dx * dx + dy * dy <= BEAM_RADIUS * BEAM_RADIUS) {
           W[sx][sy][sz] = dcomp(signal, 0.0);
         }
       }

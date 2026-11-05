@@ -2,29 +2,20 @@
 SIG		1.0
 
 // number of spatial grid points; should be divisible by the number of computational nodes
-NUM 		64
-
-// spatial grid spacing // default unit is 1/GeV
-A		0.301
-
-// temporal grid spacing - should be proportional to A*A, with the proportionality
-//                         constant determined empirically
-EPS		0.000045
+NUM             256
+A               0.07525
+EPS             0.0000026
+STEPS           6000
+UPDATE          10
+SNAPUPDATE      20
+KINTERM         0
 
 // convergence tolerance for ground state energy
 // negative value for disabling the tolerance condition,
 // so that the STEPS parameter will be the actual # of steps to take
 TOLERANCE	-1.
 
-// maximum # of steps to take
-// If TOLERANCE is negative, this will be the actual # of steps to take
-STEPS   	9000
 
-// how many steps before recording measurables
-UPDATE		10
-
-// how many steps before dumping all variables to file; "taking a snapshot"
-SNAPUPDATE	50
 
 // set to one to dump debugging files containing snapshot "slices"
 DUMPSNAPS	4
@@ -38,8 +29,6 @@ SAVEWAVEFNCS	1
 // set to one to dump the decay table time -> energy
 SAVEDECAY       1
 
-// set to one to use the relativistic version of the kintetic term: 20/03/2018
-KINTERM    0
 
 //
 // potential to simulate
@@ -102,3 +91,28 @@ MASS		0.3
 // string tension in units GeV^2
 SIGMA		0.223
 
+
+
+
+// -----------------------------------------------------------------
+// 3D Acoustic Helmholtz Renderer Parameters
+// -----------------------------------------------------------------
+VDBFILE         input/skull_density.vdb
+
+C_MEDIUM        1500.0
+C_OBJECT        1200.0
+
+FREQ            0.0
+WAVELENGTH      5.0
+
+SOURCE_AMP      2.0
+BEAM_RADIUS     45
+
+SPONGE          14
+SPONGE_DAMP     0.18
+
+// Auto-align any input VDB bounding box to the center of the solver grid (1 = on, 0 = off)
+AUTO_ALIGN      1
+
+// Fraction of the grid (0.1 to 0.9) occupied by the object's longest axis
+OBJECT_FILL     0.65
