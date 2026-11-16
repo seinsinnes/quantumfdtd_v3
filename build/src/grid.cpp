@@ -55,6 +55,8 @@ dcomp ***tmp;
 
 dcomp ***w_prev;
 double ***c_speed;
+double ***helmholtz_sq;
+
 
 // allocate memory arrays
 void allocateMemory()
@@ -77,6 +79,16 @@ void allocateMemory()
         for (int sy = 0; sy < NUM + 2; sy++) {
             int offset = (sx * (NUM + 2) * (NUM + 2)) + (sy * (NUM + 2));
             c_speed[sx][sy] = flat_c_speed + offset;
+        }
+    }
+
+    double* flat_helmholtz = new double[(NUMX + 2) * (NUM + 2) * (NUM + 2)];
+    helmholtz_sq = new double**[NUMX + 2];
+    for (int sx = 0; sx < NUMX + 2; sx++) {
+        helmholtz_sq[sx] = new double*[NUM + 2];
+        for (int sy = 0; sy < NUM + 2; sy++) {
+            int offset = (sx * (NUM + 2) * (NUM + 2)) + (sy * (NUM + 2));
+            helmholtz_sq[sx][sy] = flat_helmholtz + offset;
         }
     }
 

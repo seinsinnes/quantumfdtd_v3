@@ -383,50 +383,75 @@ void loadWaveSpeedsFromVDB(const std::string& vdb_filepath)
 void exportVDBFrame(int frame_number)
 {
   int local_elements = NUMX * NUM * NUM;
-  std::vector<float> local_slice(local_elements);
+  std::vector<float> local_amp(local_elements);
+  std::vector<float> local_helm(local_elements);
 
   int idx = 0;
   for (int sx = 1; sx <= NUMX; ++sx) {
     for (int sy = 1; sy <= NUM; ++sy) {
       for (int sz = 1; sz <= NUM; ++sz) {
-        local_slice[idx++] = static_cast<float>(real(w[sx][sy][sz]));
+        local_amp[idx]  = static_cast<float>(real(w[sx][sy][sz]));
+        // sqrt(2 * <P^2>) recovers the stationary Helmholtz wave envelope |u(x)|
+        local_helm[idx] = static_cast<float>(std::sqrt(2.0 * helmholtz_sq[sx][sy][sz]));
+        idx++;
       }
     }
   }
 
-  std::vector<float> global_data;
+  std::vector<float> global_amp;
+  std::vector<float> global_helm;
   if (nodeID == 1) {
-    global_data.resize(NUM * NUM * NUM);
+    global_amp.resize(NUM * NUM * NUM);
+    global_helm.resize(NUM * NUM * NUM);
   }
 
   MPI_Gather(
-      local_slice.data(), local_elements, MPI_FLOAT,
-      global_data.data(), local_elements, MPI_FLOAT,
+      local_amp.data(), local_elements, MPI_FLOAT,
+      global_amp.data(), local_elements, MPI_FLOAT,
+      0, workers_comm
+  );
+
+  MPI_Gather(
+      local_helm.data(), local_elements, MPI_FLOAT,
+      global_helm.data(), local_elements, MPI_FLOAT,
       0, workers_comm
   );
 
   if (nodeID == 1) {
-    openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create(0.0f);
-
-    // Apply the exact world-space scale and translation of the input geometry
+    // Shared world-space transform (matches auto-aligned input VDB)
     openvdb::math::Transform::Ptr xform =
         openvdb::math::Transform::createLinearTransform(vdb_world_step);
     xform->postTranslate(vdb_world_origin);
-    grid->setTransform(xform);
 
-    grid->setName("amplitude");
+    // Grid 1: Transient FDTD Wave Amplitude
+    openvdb::FloatGrid::Ptr ampGrid = openvdb::FloatGrid::create(0.0f);
+    ampGrid->setTransform(xform);
+    ampGrid->setName("amplitude");
+    openvdb::FloatGrid::Accessor ampAcc = ampGrid->getAccessor();
 
-    openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
+    // Grid 2: Steady-State RMS Helmholtz Envelope
+    openvdb::FloatGrid::Ptr helmGrid = openvdb::FloatGrid::create(0.0f);
+    helmGrid->setTransform(xform->copy());
+    helmGrid->setName("helmholtz_energy");
+    openvdb::FloatGrid::Accessor helmAcc = helmGrid->getAccessor();
 
     int g_idx = 0;
     for (int x = 0; x < NUM; ++x) {
       for (int y = 0; y < NUM; ++y) {
         for (int z = 0; z < NUM; ++z) {
-          // Store rectified magnitude so both positive and negative wave phases glow in Houdini
-          float mag = std::abs(global_data[g_idx++]);
+          openvdb::Coord ijk(x, y, z);
+
+          float mag = std::abs(global_amp[g_idx]);
           if (mag > 1e-4f) {
-            accessor.setValue(openvdb::Coord(x, y, z), mag);
+            ampAcc.setValue(ijk, mag);
           }
+
+          float h_env = global_helm[g_idx];
+          if (h_env > 1e-4f) {
+            helmAcc.setValue(ijk, h_env);
+          }
+
+          g_idx++;
         }
       }
     }
@@ -436,14 +461,14 @@ void exportVDBFrame(int frame_number)
 
     openvdb::io::File file(filename);
     openvdb::GridPtrVec grids;
-    grids.push_back(grid);
+    grids.push_back(ampGrid);
+    grids.push_back(helmGrid);
     file.write(grids);
     file.close();
 
-    std::cout << "==> Exported VDB snapshot: " << filename << std::endl;
+    std::cout << "==> Exported VDB snapshot (amplitude + helmholtz_energy): " << filename << std::endl;
   }
 }
-
 /*---------------------------------------------------------------------------*/
 /* Solver Initialization, Loop, and Finalization                             */
 /*---------------------------------------------------------------------------*/
@@ -504,6 +529,7 @@ void solveInitialize()
         w[sx][sy][sz] = dcomp(0.0, 0.0);
         W[sx][sy][sz] = dcomp(0.0, 0.0);
         w_prev[sx][sy][sz] = dcomp(0.0, 0.0);
+        helmholtz_sq[sx][sy][sz] = 0.0;
       }
     }
   }
@@ -693,6 +719,17 @@ void evolve(int nsteps)
 
     // Advance time planes: w_prev = w, w = W
     copyDown();
+
+    // 3. Accumulate Steady-State Helmholtz Envelope (EMA over 4 wave cycles)
+    double alpha = std::min(1.0, (EPS * FREQ) / 4.0);
+    for (int sx = 1; sx <= NUMX; sx++) {
+      for (int sy = 1; sy <= NUM; sy++) {
+        for (int sz = 1; sz <= NUM; sz++) {
+          double p = real(w[sx][sy][sz]);
+          helmholtz_sq[sx][sy][sz] = (1.0 - alpha) * helmholtz_sq[sx][sy][sz] + alpha * (p * p);
+        }
+      }
+    }
   }
 }
 
