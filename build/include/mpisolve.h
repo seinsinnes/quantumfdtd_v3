@@ -43,6 +43,13 @@ extern char *DATAFOLD; //R: ADDED EXTERNAL DIRECTORY FOR OUTPUT DATA
 extern int    AUTO_ALIGN;    // 1 = Auto-fit VDB bbox to grid, 0 = Manual [0, NUM*A] coords
 extern double OBJECT_FILL;   // Fraction of grid spanned by object's longest axis (0.1 to 0.9)
 
+extern int    SOURCE_MODE;    // 0 = Continuous Wave (CW), 1 = Gaussian Tone-Burst Pulse
+extern double PULSE_CYCLES;   // Width of pulse envelope in carrier cycles (e.g., 2.5)
+extern double PULSE_INTERVAL; // Repeat period in wave cycles (0.0 = single-shot pulse)
+
+extern double RHO_OBJECT;     // Relative mass density of object vs. medium (e.g., 4.0)
+extern int    SHARPEN_VDB;    // 1 = Crisp smoothstep boundary for strong reflections
+
 extern int nodeID, numNodes, debug;
 
 extern dcomp energyCollect;

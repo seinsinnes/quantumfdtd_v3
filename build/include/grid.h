@@ -42,6 +42,7 @@ extern dcomp ***a, ***b;
 extern dcomp ***w_prev;
 extern double ***c_speed;
 extern double ***helmholtz_sq;
+extern double ***rho_field;
 
 // number of snapshots to capture in memory
 extern int nsnaps;

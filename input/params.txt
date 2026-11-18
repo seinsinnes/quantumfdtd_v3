@@ -3,8 +3,8 @@ SIG		1.0
 
 // number of spatial grid points; should be divisible by the number of computational nodes
 NUM             256
-A               0.07525
-EPS             0.0000026
+A               0.01
+EPS             0.0000018
 STEPS           6000
 UPDATE          10
 SNAPUPDATE      20
@@ -99,11 +99,11 @@ SIGMA		0.223
 // -----------------------------------------------------------------
 VDBFILE         input/skull_density.vdb
 
-C_MEDIUM        1500.0
-C_OBJECT        1200.0
+C_MEDIUM        2400.0
+C_OBJECT        1500.0
 
 FREQ            0.0
-WAVELENGTH      5.0
+WAVELENGTH      6.5
 
 SOURCE_AMP      2.0
 BEAM_RADIUS     45
@@ -116,3 +116,15 @@ AUTO_ALIGN      1
 
 // Fraction of the grid (0.1 to 0.9) occupied by the object's longest axis
 OBJECT_FILL     0.65
+
+// 0 = Continuous Wave (Helmholtz standing waves), 1 = Gaussian Tone-Burst Pulse
+SOURCE_MODE     1
+
+// Pulse duration in carrier cycles (1.5 to 3.0 mimics diagnostic ultrasound)
+PULSE_CYCLES    2.0
+
+// Repeat interval in wave cycles (0.0 = single pulse, 60.0 = periodic sonar pings)
+PULSE_INTERVAL  0.0
+
+RHO_OBJECT      4.0
+SHARPEN_VDB     1

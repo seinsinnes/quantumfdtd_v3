@@ -56,6 +56,7 @@ dcomp ***tmp;
 dcomp ***w_prev;
 double ***c_speed;
 double ***helmholtz_sq;
+double ***rho_field;
 
 
 // allocate memory arrays
@@ -89,6 +90,16 @@ void allocateMemory()
         for (int sy = 0; sy < NUM + 2; sy++) {
             int offset = (sx * (NUM + 2) * (NUM + 2)) + (sy * (NUM + 2));
             helmholtz_sq[sx][sy] = flat_helmholtz + offset;
+        }
+    }
+
+    double* flat_rho = new double[(NUMX + 2) * (NUM + 2) * (NUM + 2)];
+    rho_field = new double**[NUMX + 2];
+    for (int sx = 0; sx < NUMX + 2; sx++) {
+        rho_field[sx] = new double*[NUM + 2];
+        for (int sy = 0; sy < NUM + 2; sy++) {
+            int offset = (sx * (NUM + 2) * (NUM + 2)) + (sy * (NUM + 2));
+            rho_field[sx][sy] = flat_rho + offset;
         }
     }
 

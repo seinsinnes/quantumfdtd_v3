@@ -46,6 +46,8 @@ char *DATAFOLD = NULL;
 int SAVEPOT = 0;
 int SAVEDECAY = 0;
 double POTCRITR = 3., POTFLATR = -1.;
+double RHO_OBJECT  = 4.0;     // Relative density (bone/stone/ceramic vs. water)
+int    SHARPEN_VDB = 1;       // Steepens blurry VDB transitions so surfaces reflect cleanly
 
 // Acoustic Helmholtz Renderer defaults (overridden by input/params.txt)
 double C_MEDIUM    = 1500.0;  // Background wave speed (m/s)
@@ -115,6 +117,9 @@ int snapcnt = -1;
 
 int    AUTO_ALIGN  = 1;       // Auto-center and scale input VDB bounding box
 double OBJECT_FILL = 0.65;    // Object spans 65% of the NUM grid along its longest axis
+int    SOURCE_MODE    = 0;    // 0 = Continuous Wave, 1 = Gaussian Pulse
+double PULSE_CYCLES   = 2.5;  // Number of carrier cycles in the tone burst
+double PULSE_INTERVAL = 0.0;  // 0.0 = fire once; > 0 = repeat every N wave cycles
 
 // Shared transform mapping solver voxel indices [0..NUM-1] <-> Houdini World Space
 double         vdb_world_step = 0.01;
@@ -281,10 +286,14 @@ void loadWaveSpeedsFromVDB(const std::string& vdb_filepath)
   openvdb::initialize();
 
   // Default entire local grid (including ghost cells) to background medium speed
-  for (int sx = 0; sx < NUMX + 2; sx++)
-    for (int sy = 0; sy < NUM + 2; sy++)
-      for (int sz = 0; sz < NUM + 2; sz++)
+  for (int sx = 0; sx < NUMX + 2; sx++) {
+    for (int sy = 0; sy < NUM + 2; sy++) {
+      for (int sz = 0; sz < NUM + 2; sz++) {
         c_speed[sx][sy][sz] = C_MEDIUM;
+        rho_field[sx][sy][sz] = 1.0;
+      }
+    }
+  }
 
   // Fallback transform if VDB is missing or AUTO_ALIGN == 0
   vdb_world_step = A;
@@ -341,14 +350,13 @@ void loadWaveSpeedsFromVDB(const std::string& vdb_filepath)
       sampler(accessor, grid->transform());
 
   int local_solid_voxels = 0;
-  for (int sx = 1; sx <= NUMX; sx++) {
-    for (int sy = 1; sy <= NUM; sy++) {
-      for (int sz = 1; sz <= NUM; sz++) {
+  for (int sx = 0; sx <= NUMX + 1; sx++) {
+    for (int sy = 0; sy <= NUM + 1; sy++) {
+      for (int sz = 0; sz <= NUM + 1; sz++) {
         int global_x = (nodeID - 1) * NUMX + (sx - 1);
         int global_y = sy - 1;
         int global_z = sz - 1;
 
-        // Map solver index (global_x, global_y, global_z) into VDB world space
         openvdb::Vec3R worldPos(
             vdb_world_origin.x() + global_x * vdb_world_step,
             vdb_world_origin.y() + global_y * vdb_world_step,
@@ -358,8 +366,18 @@ void loadWaveSpeedsFromVDB(const std::string& vdb_filepath)
         float density = sampler.wsSample(worldPos);
         density = std::max(0.0f, std::min(1.0f, density));
 
-        if (density > 0.01f) local_solid_voxels++;
-        c_speed[sx][sy][sz] = C_MEDIUM + density * (C_OBJECT - C_MEDIUM);
+        if (SHARPEN_VDB) {
+          // Steepens blurry upsampled VDB gradients around the 0.5 isosurface
+          float t = std::max(0.0f, std::min(1.0f, (density - 0.35f) / 0.30f));
+          density = t * t * (3.0f - 2.0f * t);
+        }
+
+        if (sx >= 1 && sx <= NUMX && sy >= 1 && sy <= NUM && sz >= 1 && sz <= NUM) {
+          if (density > 0.01f) local_solid_voxels++;
+        }
+
+        c_speed[sx][sy][sz]   = C_MEDIUM + density * (C_OBJECT - C_MEDIUM);
+        rho_field[sx][sy][sz] = 1.0 + density * (RHO_OBJECT - 1.0);
       }
     }
   }
@@ -485,13 +503,15 @@ void solveInitialize()
     FREQ = C_MEDIUM / (WAVELENGTH * A);
   }
 
-  if (nodeID == 1)
+if (nodeID == 1)
   {
+    
     double c_max = std::max(C_MEDIUM, C_OBJECT);
     double c_min = std::min(C_MEDIUM, C_OBJECT);
     double cfl_max_dt = A / (c_max * sqrt(3.0));
     double min_voxels_per_wave = (c_min / FREQ) / A;
 
+    mkdir(DATAFOLD, 0777);
     print_line();
     cout << "==> Acoustic Solver Configuration:" << endl;
     cout << "    VDB Geometry File : " << VDBFILE << endl;
@@ -501,6 +521,12 @@ void solveInitialize()
     cout << "    Wall Absorption   : Sponge = " << SPONGE << " voxels, Damp = " << SPONGE_DAMP << endl;
     cout << "    Resolution Check  : " << min_voxels_per_wave << " voxels/wavelength (min)" << endl;
     cout << "    CFL Stability     : EPS = " << EPS << " s (Max safe EPS = " << cfl_max_dt << " s)" << endl;
+    cout << "    Source Mode       : "
+         << (SOURCE_MODE == 1 ? "Gaussian Pulse" : "Continuous Wave (CW)") << endl;
+    if (SOURCE_MODE == 1) {
+      cout << "    Pulse Shape       : " << PULSE_CYCLES << " cycles, Repeat = "
+           << PULSE_INTERVAL << " cycles" << endl;
+    }
 
     if (EPS > cfl_max_dt) {
       cerr << "WARNING: EPS exceeds CFL limit! Simulation will explode into NaNs." << endl;
@@ -698,21 +724,51 @@ void evolve(int nsteps)
       }
     }
 
-    // 2. Configurable Disc Transducer Source
+    // 2. Configurable Disc Transducer Source (CW vs. Gated Gaussian Pulse)
     double current_time = global_step * EPS;
-    double signal = SOURCE_AMP * sin(2.0 * M_PI * FREQ * current_time);
+    double signal = 0.0;
+    bool source_active = true;
 
-    int center_x = NUM / 2;
-    int center_y = NUM / 2;
-    int sz = std::max(1, NUM - SPONGE - 1); // Place just inside the top sponge boundary
+    if (SOURCE_MODE == 0) {
+      // Continuous Wave (CW)
+      signal = SOURCE_AMP * sin(2.0 * M_PI * FREQ * current_time);
+    } else {
+      // Gaussian-modulated tone burst: exp(-(u / tau)^2) * sin(2 * pi * f * u)
+      double tau = std::max(0.5, PULSE_CYCLES) / (2.0 * FREQ);
+      double t0  = 3.5 * tau; // Delay peak so envelope starts smoothly near 0 at t=0
 
-    for (int sx = 1; sx <= NUMX; sx++) {
-      int global_x = (nodeID - 1) * NUMX + (sx - 1);
-      int dx = global_x - center_x;
-      for (int sy = 1; sy <= NUM; sy++) {
-        int dy = (sy - 1) - center_y;
-        if (dx * dx + dy * dy <= BEAM_RADIUS * BEAM_RADIUS) {
-          W[sx][sy][sz] = dcomp(signal, 0.0);
+      double local_t = current_time;
+      if (PULSE_INTERVAL > 0.0) {
+        double rep_period = PULSE_INTERVAL / FREQ;
+        if (rep_period > 2.0 * t0) {
+          local_t = fmod(current_time, rep_period);
+        }
+      }
+
+      double u = local_t - t0;
+      double envelope = exp(-(u * u) / (tau * tau));
+
+      if (envelope > 1e-4) {
+        signal = SOURCE_AMP * envelope * sin(2.0 * M_PI * FREQ * u);
+      } else {
+        // Release transducer voxels so returning echoes pass through without reflecting
+        source_active = false;
+      }
+    }
+
+    if (source_active) {
+      int center_x = NUM / 2;
+      int center_y = NUM / 2;
+      int sz = std::max(1, NUM - SPONGE - 1);
+
+      for (int sx = 1; sx <= NUMX; sx++) {
+        int global_x = (nodeID - 1) * NUMX + (sx - 1);
+        int dx = global_x - center_x;
+        for (int sy = 1; sy <= NUM; sy++) {
+          int dy = (sy - 1) - center_y;
+          if (dx * dx + dy * dy <= BEAM_RADIUS * BEAM_RADIUS) {
+            W[sx][sy][sz] = dcomp(signal, 0.0);
+          }
         }
       }
     }
@@ -720,8 +776,9 @@ void evolve(int nsteps)
     // Advance time planes: w_prev = w, w = W
     copyDown();
 
-    // 3. Accumulate Steady-State Helmholtz Envelope (EMA over 4 wave cycles)
-    double alpha = std::min(1.0, (EPS * FREQ) / 4.0);
+    // 3. Accumulate Envelope (4 cycles for CW standing wave, 1 cycle for B-mode pulse envelope)
+    double window_cycles = (SOURCE_MODE == 1) ? 1.0 : 4.0;
+    double alpha = std::min(1.0, (EPS * FREQ) / window_cycles);
     for (int sx = 1; sx <= NUMX; sx++) {
       for (int sy = 1; sy <= NUM; sy++) {
         for (int sz = 1; sz <= NUM; sz++) {
@@ -814,19 +871,33 @@ void wfncKinetic(dcomp ***wfnc)
 {
   switch (KINTERM)
   {
-  case 0: // 3D ACOUSTIC WAVE EQUATION SPATIAL OPERATOR: c(x,y,z)^2 * Laplacian(P)
-    for (int sx = 1; sx <= NUMX; sx++) {
-      for (int sy = 1; sy <= NUM; sy++) {
-        for (int sz = 1; sz <= NUM; sz++) {
-          double local_c = c_speed[sx][sy][sz];
-          double c_sq = local_c * local_c;
+  case 0: // VARIABLE-DENSITY ACOUSTIC OPERATOR: rho * c^2 * div((1/rho) * grad(P))
+    {
+      double inv_A2 = 1.0 / (A * A);
+      for (int sx = 1; sx <= NUMX; sx++) {
+        for (int sy = 1; sy <= NUM; sy++) {
+          for (int sz = 1; sz <= NUM; sz++) {
+            double rc = rho_field[sx][sy][sz];
+            double local_c = c_speed[sx][sy][sz];
+            double bulk = rc * local_c * local_c;
 
-          dcomp laplacian = (wfnc[sx + 1][sy][sz] + wfnc[sx - 1][sy][sz] +
-                             wfnc[sx][sy + 1][sz] + wfnc[sx][sy - 1][sz] +
-                             wfnc[sx][sy][sz + 1] + wfnc[sx][sy][sz - 1] -
-                             ((dcomp)6.) * wfnc[sx][sy][sz]) / (A * A);
+            // Harmonic inverse-density face weights: 2 / (rho_i + rho_j)
+            double bx_p = 2.0 / (rc + rho_field[sx + 1][sy][sz]);
+            double bx_m = 2.0 / (rc + rho_field[sx - 1][sy][sz]);
+            double by_p = 2.0 / (rc + rho_field[sx][sy + 1][sz]);
+            double by_m = 2.0 / (rc + rho_field[sx][sy - 1][sz]);
+            double bz_p = 2.0 / (rc + rho_field[sx][sy][sz + 1]);
+            double bz_m = 2.0 / (rc + rho_field[sx][sy][sz - 1]);
 
-          t_kin[sx][sy][sz] = c_sq * laplacian;
+            double p_c = real(wfnc[sx][sy][sz]);
+            double div_grad = (
+                bx_p * (real(wfnc[sx + 1][sy][sz]) - p_c) - bx_m * (p_c - real(wfnc[sx - 1][sy][sz])) +
+                by_p * (real(wfnc[sx][sy + 1][sz]) - p_c) - by_m * (p_c - real(wfnc[sx][sy - 1][sz])) +
+                bz_p * (real(wfnc[sx][sy][sz + 1]) - p_c) - bz_m * (p_c - real(wfnc[sx][sy][sz - 1]))
+            ) * inv_A2;
+
+            t_kin[sx][sy][sz] = dcomp(bulk * div_grad, 0.0);
+          }
         }
       }
     }

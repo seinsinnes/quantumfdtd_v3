@@ -97,6 +97,16 @@ void setParameter(const char *key, const char *value)
         AUTO_ALIGN = atoi(value);
     } else if (strcmp(key, "OBJECT_FILL") == 0) {
         OBJECT_FILL = atof(value);
+    } else if (strcmp(key, "SOURCE_MODE") == 0) {
+        SOURCE_MODE = atoi(value);
+    } else if (strcmp(key, "PULSE_CYCLES") == 0) {
+        PULSE_CYCLES = atof(value);
+    } else if (strcmp(key, "PULSE_INTERVAL") == 0) {
+        PULSE_INTERVAL = atof(value);
+    } else if (strcmp(key, "RHO_OBJECT") == 0) {
+        RHO_OBJECT = atof(value);
+    } else if (strcmp(key, "SHARPEN_VDB") == 0) {
+        SHARPEN_VDB = atoi(value);
     }
     return;
 }
