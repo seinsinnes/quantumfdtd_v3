@@ -50,6 +50,11 @@ extern double PULSE_INTERVAL; // Repeat period in wave cycles (0.0 = single-shot
 extern double RHO_OBJECT;     // Relative mass density of object vs. medium (e.g., 4.0)
 extern int    SHARPEN_VDB;    // 1 = Crisp smoothstep boundary for strong reflections
 
+extern int    RECEIVE_ECHO;   // 1 = Record transducer echoes and reconstruct 2D B-mode
+extern int    RX_STRIDE;      // Transducer receiver spacing in voxels (e.g., 2)
+extern double BMODE_DB;       // B-mode logarithmic dynamic range in dB (e.g., 40.0)
+extern double BMODE_FNUM;     // Dynamic receive aperture F-number (e.g., 1.0)
+
 extern int nodeID, numNodes, debug;
 
 extern dcomp energyCollect;

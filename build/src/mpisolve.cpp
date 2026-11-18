@@ -121,6 +121,20 @@ int    SOURCE_MODE    = 0;    // 0 = Continuous Wave, 1 = Gaussian Pulse
 double PULSE_CYCLES   = 2.5;  // Number of carrier cycles in the tone burst
 double PULSE_INTERVAL = 0.0;  // 0.0 = fire once; > 0 = repeat every N wave cycles
 
+int    RECEIVE_ECHO = 0;      // 0 = Off, 1 = Record echoes & reconstruct B-mode
+int    RX_STRIDE    = 2;      // Sample every Nth voxel across transducer disc
+double BMODE_DB     = 40.0;   // Display dynamic range (dB)
+double BMODE_FNUM   = 1.0;    // Receive focal ratio (aperture = depth / FNUM)
+
+struct ReceiverElem {
+  int sx, sy, gx, gy;
+};
+std::vector<ReceiverElem> local_rx;
+std::vector<float>        local_rf_data;
+int                       rf_num_steps = 0;
+
+void reconstructBMode();
+
 // Shared transform mapping solver voxel indices [0..NUM-1] <-> Houdini World Space
 double         vdb_world_step = 0.01;
 openvdb::Vec3d vdb_world_origin(0.0, 0.0, 0.0);
@@ -559,6 +573,49 @@ if (nodeID == 1)
       }
     }
   }
+
+  if (RECEIVE_ECHO != 0) {
+    rf_num_steps = (STEPS / UPDATE) * UPDATE;
+    int stride = std::max(1, RX_STRIDE);
+    int center_x = NUM / 2;
+    int center_y = NUM / 2;
+
+    local_rx.clear();
+    for (int sx = 1; sx <= NUMX; sx++) {
+      int gx = (nodeID - 1) * NUMX + (sx - 1);
+      int dx = gx - center_x;
+      if (dx % stride != 0) continue;
+
+      for (int sy = 1; sy <= NUM; sy++) {
+        int gy = sy - 1;
+        int dy = gy - center_y;
+        if (dy % stride != 0) continue;
+
+        if (dx * dx + dy * dy <= BEAM_RADIUS * BEAM_RADIUS) {
+          local_rx.push_back({sx, sy, gx, gy});
+        }
+      }
+    }
+
+    local_rf_data.assign(local_rx.size() * rf_num_steps, 0.0f);
+
+    int local_count = static_cast<int>(local_rx.size());
+    int total_count = 0;
+    MPI_Reduce(&local_count, &total_count, 1, MPI_INT, MPI_SUM, 0, workers_comm);
+
+    if (nodeID == 1) {
+      int z_src = std::max(1, NUM - SPONGE - 1) - 1;
+      double min_rt_time = 2.0 * (z_src - SPONGE) * A / C_MEDIUM;
+      int recommended_steps = static_cast<int>(min_rt_time / EPS) + 200;
+
+      cout << "==> B-Mode Receiver Array : " << total_count << " hydrophone channels (stride = "
+           << stride << "), recording " << rf_num_steps << " steps." << endl;
+      cout << "    Full-Depth Echo Budget: ~" << recommended_steps << " steps required." << endl;
+      if (SOURCE_MODE == 0) {
+        cerr << "WARNING: RECEIVE_ECHO = 1 requires pulsed mode (SOURCE_MODE = 1) for time-of-flight imaging!" << endl;
+      }
+    }
+  }
 }
 
 void solve()
@@ -600,6 +657,11 @@ void solve()
 
 void solveFinalize()
 {
+  if (RECEIVE_ECHO != 0 && rf_num_steps > 0)
+  {
+    reconstructBMode();
+  }
+
   if (KINTERM != 0)
   {
     fftw_destroy_plan(fftw_par.plan_fftw);
@@ -607,6 +669,260 @@ void solveFinalize()
     fftw_free(fftw_par.in);
     fftw_free(fftw_par.out);
   }
+}
+
+static void writePGM(const std::string& filepath, const std::vector<float>& img, int width, int height)
+{
+  std::ofstream out(filepath, std::ios::binary);
+  if (!out) return;
+  out << "P5\n" << width << " " << height << "\n255\n";
+  // Row 0 = top of grid (transducer at z = NUM-1), bottom row = deep z = 0
+  for (int row = 0; row < height; ++row) {
+    int gz = (height - 1) - row;
+    for (int col = 0; col < width; ++col) {
+      float v = std::max(0.0f, std::min(1.0f, img[col * height + gz]));
+      unsigned char px = static_cast<unsigned char>(v * 255.0f + 0.5f);
+      out.write(reinterpret_cast<const char*>(&px), 1);
+    }
+  }
+}
+
+void reconstructBMode()
+{
+  int local_count = static_cast<int>(local_rx.size());
+  std::vector<int> rx_counts(numNodes, 0);
+  MPI_Gather(&local_count, 1, MPI_INT, rx_counts.data(), 1, MPI_INT, 0, workers_comm);
+
+  std::vector<int> coord_counts(numNodes, 0), coord_displs(numNodes, 0);
+  std::vector<int> rf_counts(numNodes, 0), rf_displs(numNodes, 0);
+  int total_rx = 0;
+
+  if (nodeID == 1) {
+    for (int r = 0; r < numNodes; ++r) {
+      coord_counts[r] = 2 * rx_counts[r];
+      coord_displs[r] = 2 * total_rx;
+      rf_counts[r]    = rx_counts[r] * rf_num_steps;
+      rf_displs[r]    = total_rx * rf_num_steps;
+      total_rx       += rx_counts[r];
+    }
+  }
+
+  std::vector<int> local_coords(2 * local_count);
+  for (int m = 0; m < local_count; ++m) {
+    local_coords[2 * m]     = local_rx[m].gx;
+    local_coords[2 * m + 1] = local_rx[m].gy;
+  }
+
+  std::vector<int>   global_coords(nodeID == 1 ? 2 * total_rx : 1);
+  std::vector<float> global_rf(nodeID == 1 ? std::max(1, total_rx * rf_num_steps) : 1);
+  int   dummy_int   = 0;
+  float dummy_float = 0.0f;
+
+  MPI_Gatherv(
+      local_coords.empty() ? &dummy_int : local_coords.data(), 2 * local_count, MPI_INT,
+      global_coords.data(), coord_counts.data(), coord_displs.data(), MPI_INT,
+      0, workers_comm
+  );
+
+  MPI_Gatherv(
+      local_rf_data.empty() ? &dummy_float : local_rf_data.data(), local_count * rf_num_steps, MPI_FLOAT,
+      global_rf.data(), rf_counts.data(), rf_displs.data(), MPI_FLOAT,
+      0, workers_comm
+  );
+
+  if (nodeID != 1 || total_rx == 0) return;
+
+  std::cout << "==> Reconstructing 2D Delay-and-Sum B-Mode Ultrasound (" << total_rx << " channels)..." << std::endl;
+
+  const int N_t = rf_num_steps;
+  double tau = std::max(0.5, PULSE_CYCLES) / (2.0 * FREQ);
+  double t0  = 3.5 * tau;
+  double mute_t     = 2.4 * t0;
+  double mute_width = 0.2 * t0;
+
+  // 1. Bandpass + Hilbert Analytic Signal via 1D FFTW
+  std::vector<std::complex<float>> analytic_rf(static_cast<size_t>(total_rx) * N_t);
+  fftw_complex* fft_in  = fftw_alloc_complex(N_t);
+  fftw_complex* fft_mid = fftw_alloc_complex(N_t);
+  fftw_complex* fft_out = fftw_alloc_complex(N_t);
+
+  fftw_plan p_fwd = fftw_plan_dft_1d(N_t, fft_in, fft_mid, FFTW_FORWARD, FFTW_ESTIMATE);
+  fftw_plan p_inv = fftw_plan_dft_1d(N_t, fft_mid, fft_out, FFTW_BACKWARD, FFTW_ESTIMATE);
+
+  for (int m = 0; m < total_rx; ++m) {
+    const float* trace = &global_rf[static_cast<size_t>(m) * N_t];
+    for (int n = 0; n < N_t; ++n) {
+      double t = (n + 1) * EPS;
+      double tx_gate = 0.5 * (1.0 + std::tanh((t - mute_t) / mute_width));
+      fft_in[n][0] = trace[n] * tx_gate;
+      fft_in[n][1] = 0.0;
+    }
+
+    fftw_execute(p_fwd);
+
+    for (int k = 0; k < N_t; ++k) {
+      double h_mult = 0.0;
+      if (k > 0 && k < (N_t + 1) / 2) {
+        h_mult = 2.0;
+      } else if (N_t % 2 == 0 && k == N_t / 2) {
+        h_mult = 1.0;
+      }
+
+      if (h_mult > 0.0) {
+        double freq_k = static_cast<double>(k) / (N_t * EPS);
+        double bp = std::exp(-0.5 * pow2((freq_k - FREQ) / (0.65 * FREQ)));
+        double scale = (h_mult * bp) / static_cast<double>(N_t);
+        fft_mid[k][0] *= scale;
+        fft_mid[k][1] *= scale;
+      } else {
+        fft_mid[k][0] = 0.0;
+        fft_mid[k][1] = 0.0;
+      }
+    }
+
+    fftw_execute(p_inv);
+
+    std::complex<float>* dst = &analytic_rf[static_cast<size_t>(m) * N_t];
+    for (int n = 0; n < N_t; ++n) {
+      dst[n] = std::complex<float>(static_cast<float>(fft_out[n][0]),
+                                   static_cast<float>(fft_out[n][1]));
+    }
+  }
+
+  fftw_destroy_plan(p_fwd);
+  fftw_destroy_plan(p_inv);
+  fftw_free(fft_in);
+  fftw_free(fft_mid);
+  fftw_free(fft_out);
+
+  // 2. Calibrate 2nd-order FDTD discrete group velocity
+  double omega = 2.0 * M_PI * FREQ;
+  double s_med = C_MEDIUM * EPS / A;
+  double v_eff = C_MEDIUM;
+  double sin_ratio = std::sin(0.5 * omega * EPS) / s_med;
+  if (sin_ratio > 0.0 && sin_ratio < 0.995) {
+    double kA_half = std::asin(sin_ratio);
+    v_eff = C_MEDIUM * std::cos(kA_half) / std::cos(0.5 * omega * EPS);
+  }
+
+  // 3. Plane-Wave Transmit + Dynamic-Receive Delay-and-Sum (XZ and YZ Biplane)
+  int z_src    = std::max(1, NUM - SPONGE - 1) - 1;
+  int center_x = NUM / 2;
+  int center_y = NUM / 2;
+  double fnum  = std::max(0.25, BMODE_FNUM);
+
+  auto beamformSlice = [&](bool is_xz, std::vector<float>& env_slice) {
+    env_slice.assign(NUM * NUM, 0.0f);
+    for (int u = 0; u < NUM; ++u) {
+      int px = is_xz ? u : center_x;
+      int py = is_xz ? center_y : u;
+
+      for (int gz = 0; gz < z_src - 2; ++gz) {
+        double dz = (z_src - gz) * A;
+        double half_ap  = std::max(2.0 * A, dz / (2.0 * fnum));
+        double half_ap2 = half_ap * half_ap;
+
+        std::complex<double> acc(0.0, 0.0);
+        double w_sum = 0.0;
+
+        for (int m = 0; m < total_rx; ++m) {
+          double dx = (px - global_coords[2 * m]) * A;
+          double dy = (py - global_coords[2 * m + 1]) * A;
+          double r_lat2 = dx * dx + dy * dy;
+          if (r_lat2 >= half_ap2) continue;
+
+          double r_lat = std::sqrt(r_lat2);
+          double apod  = 0.5 * (1.0 + std::cos(M_PI * r_lat / half_ap));
+          double d_rx  = std::sqrt(r_lat2 + dz * dz);
+
+          double t_echo = t0 + (dz + d_rx) / v_eff;
+          double f_idx  = (t_echo / EPS) - 1.0;
+
+          if (f_idx >= 0.0 && f_idx < N_t - 1) {
+            int idx0 = static_cast<int>(f_idx);
+            float frac = static_cast<float>(f_idx - idx0);
+            const std::complex<float>* ch = &analytic_rf[static_cast<size_t>(m) * N_t];
+            std::complex<float> s = (1.0f - frac) * ch[idx0] + frac * ch[idx0 + 1];
+
+            double tgc = d_rx / A; // 3D spherical spreading Time-Gain Compensation
+            acc   += apod * tgc * std::complex<double>(s.real(), s.imag());
+            w_sum += apod;
+          }
+        }
+
+        if (w_sum > 1e-6) {
+          env_slice[u * NUM + gz] = static_cast<float>(std::abs(acc) / w_sum);
+        }
+      }
+    }
+  };
+
+  std::vector<float> env_xz, env_yz;
+  beamformSlice(true,  env_xz);
+  beamformSlice(false, env_yz);
+
+  // 4. Logarithmic dB Compression
+  float max_env = 1e-12f;
+  for (float v : env_xz) max_env = std::max(max_env, v);
+  for (float v : env_yz) max_env = std::max(max_env, v);
+
+  float dyn_db = static_cast<float>(std::max(10.0, BMODE_DB));
+  auto toLogBMode = [&](std::vector<float>& img) {
+    for (float& v : img) {
+      float norm = std::max(v / max_env, 1e-6f);
+      float db   = 20.0f * std::log10(norm);
+      v = std::max(0.0f, std::min(1.0f, (db + dyn_db) / dyn_db));
+    }
+  };
+  toLogBMode(env_xz);
+  toLogBMode(env_yz);
+
+  // 5. Write 2D PGM Images and World-Space Aligned OpenVDB Biplane Slices
+  std::string pgm_xz = std::string(DATAFOLD) + "/bmode_xz.pgm";
+  std::string pgm_yz = std::string(DATAFOLD) + "/bmode_yz.pgm";
+  writePGM(pgm_xz, env_xz, NUM, NUM);
+  writePGM(pgm_yz, env_yz, NUM, NUM);
+
+  openvdb::math::Transform::Ptr xform =
+      openvdb::math::Transform::createLinearTransform(vdb_world_step);
+  xform->postTranslate(vdb_world_origin);
+
+  openvdb::FloatGrid::Ptr xzGrid = openvdb::FloatGrid::create(0.0f);
+  xzGrid->setTransform(xform);
+  xzGrid->setName("bmode_xz");
+  openvdb::FloatGrid::Accessor xzAcc = xzGrid->getAccessor();
+
+  openvdb::FloatGrid::Ptr yzGrid = openvdb::FloatGrid::create(0.0f);
+  yzGrid->setTransform(xform->copy());
+  yzGrid->setName("bmode_yz");
+  openvdb::FloatGrid::Accessor yzAcc = yzGrid->getAccessor();
+
+  // Populate 3-voxel-thick orthogonal slabs so Houdini raymarching renders them crisply
+  for (int u = 0; u < NUM; ++u) {
+    for (int gz = 0; gz < NUM; ++gz) {
+      float v_xz = env_xz[u * NUM + gz];
+      if (v_xz > 1e-3f) {
+        for (int dy = -1; dy <= 1; ++dy) {
+          xzAcc.setValue(openvdb::Coord(u, center_y + dy, gz), v_xz);
+        }
+      }
+      float v_yz = env_yz[u * NUM + gz];
+      if (v_yz > 1e-3f) {
+        for (int dx = -1; dx <= 1; ++dx) {
+          yzAcc.setValue(openvdb::Coord(center_x + dx, u, gz), v_yz);
+        }
+      }
+    }
+  }
+
+  std::string vdb_path = std::string(DATAFOLD) + "/bmode_reconstruction.vdb";
+  openvdb::io::File vdb_file(vdb_path);
+  openvdb::GridPtrVec grids = {xzGrid, yzGrid};
+  vdb_file.write(grids);
+  vdb_file.close();
+
+  std::cout << "==> Saved 2D B-Mode images: " << pgm_xz << ", " << pgm_yz << std::endl;
+  std::cout << "==> Saved 3D-aligned B-Mode VDB: " << vdb_path << std::endl;
 }
 
 void evolve(int nsteps)
@@ -773,8 +1089,20 @@ void evolve(int nsteps)
       }
     }
 
-    // Advance time planes: w_prev = w, w = W
+// Advance time planes: w_prev = w, w = W
     copyDown();
+
+    // Record returning echoes at the transducer surface
+    if (RECEIVE_ECHO != 0) {
+      int t_idx = global_step - 1;
+      if (t_idx >= 0 && t_idx < rf_num_steps) {
+        int sz_rx = std::max(1, NUM - SPONGE - 1);
+        for (size_t m = 0; m < local_rx.size(); ++m) {
+          local_rf_data[m * rf_num_steps + t_idx] =
+              static_cast<float>(real(w[local_rx[m].sx][local_rx[m].sy][sz_rx]));
+        }
+      }
+    }
 
     // 3. Accumulate Envelope (4 cycles for CW standing wave, 1 cycle for B-mode pulse envelope)
     double window_cycles = (SOURCE_MODE == 1) ? 1.0 : 4.0;

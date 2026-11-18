@@ -107,6 +107,16 @@ void setParameter(const char *key, const char *value)
         RHO_OBJECT = atof(value);
     } else if (strcmp(key, "SHARPEN_VDB") == 0) {
         SHARPEN_VDB = atoi(value);
+    } else if (strcmp(key, "PULSE_INTERVAL") == 0) {
+        PULSE_INTERVAL = atof(value);
+    } else if (strcmp(key, "RECEIVE_ECHO") == 0) {
+        RECEIVE_ECHO = atoi(value);
+    } else if (strcmp(key, "RX_STRIDE") == 0) {
+        RX_STRIDE = atoi(value);
+    } else if (strcmp(key, "BMODE_DB") == 0) {
+        BMODE_DB = atof(value);
+    } else if (strcmp(key, "BMODE_FNUM") == 0) {
+        BMODE_FNUM = atof(value);
     }
     return;
 }

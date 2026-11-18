@@ -128,3 +128,13 @@ PULSE_INTERVAL  0.0
 
 RHO_OBJECT      4.0
 SHARPEN_VDB     1
+
+// Enable transducer hydrophone recording and Delay-and-Sum B-mode reconstruction
+RECEIVE_ECHO    1
+
+// Hydrophone element stride in voxels across the transducer disc
+RX_STRIDE       2
+
+// B-mode logarithmic compression dynamic range (dB) and receive F-number
+BMODE_DB        40.0
+BMODE_FNUM      1.0
